@@ -23,6 +23,7 @@ from tkinter import (
     Toplevel,
     filedialog,
     messagebox,
+    simpledialog,
     ttk,
 )
 from tkinter.scrolledtext import ScrolledText
@@ -31,16 +32,21 @@ from invest_retrospect import market, prices
 from invest_retrospect.brokers import Broker
 from invest_retrospect.core import JournalResult, run_journal, today_ymd
 from invest_retrospect.manual import (
+    DEFAULT_ACCOUNT,
     Ledger,
+    LedgerBook,
     LedgerEntry,
-    load_ledger,
+    export_book,
+    import_book,
+    load_book,
     parse_bulk_entries,
     parse_excel_entries,
     run_manual_journal,
-    save_ledger,
+    save_book,
     write_sample_xlsx,
 )
 from invest_retrospect.settings_store import (
+    MANUAL_LEDGER_PATH,
     SETTINGS_PATH,
     Settings,
     config_from_settings,
@@ -594,8 +600,8 @@ class JournalTab(ttk.Frame):
             _open_path(self._result.json_path.parent)
 
 
-class ManualLedgerTab(ttk.Frame):
-    """수동 주식 원장: 매수/매도 변화 기록 → 임의 날짜 매매일지 생성."""
+class AccountLedgerFrame(ttk.Frame):
+    """한 계좌의 수동 주식 원장: 매수/매도 변화 기록 → 임의 날짜 매매일지 생성."""
 
     _COLS = ("check", "date", "market", "name", "code", "side", "qty", "price", "tag")
     _HEADS = {
@@ -606,15 +612,22 @@ class ManualLedgerTab(ttk.Frame):
               "side": 50, "qty": 64, "price": 90, "tag": 70}
     _CHECK_ON, _CHECK_OFF = "☑", "☐"
 
-    def __init__(self, master: ttk.Notebook, app: "App") -> None:
+    def __init__(self, master: ttk.Notebook, app: "App",
+                 manual_tab: "ManualLedgerTab", name: str, ledger: Ledger) -> None:
         super().__init__(master, padding=PAD * 2)
         self.app = app
-        self.ledger: Ledger = load_ledger()
+        self.manual_tab = manual_tab
+        self.account_name = name
+        self.ledger: Ledger = ledger
         self._result: JournalResult | None = None
         self._checked: set[int] = set()    # 체크된 항목 (id(entry) 기준 — 객체 식별)
         self._build()
         self._reload_tree()
         self._refresh_price_label()
+
+    def _persist(self) -> None:
+        """원장 변경을 묶음 전체 파일에 저장 (컨테이너 경유)."""
+        self.manual_tab._save_book()
 
     # ── UI ───────────────────────────────────────────────────────────────
     def _build(self) -> None:
@@ -816,7 +829,7 @@ class ManualLedgerTab(ttk.Frame):
         if new is None:
             return
         self.ledger.entries.append(new)
-        save_ledger(self.ledger)
+        self._persist()
         self._reload_tree()
         self.in_name.set(""); self.in_code.set(""); self.in_qty.set(""); self.in_price.set("")
 
@@ -877,7 +890,7 @@ class ManualLedgerTab(ttk.Frame):
             # 기존 객체를 in-place 수정 → 체크 상태(id 기준) 보존
             e.date, e.stk_cd, e.stk_nm, e.side, e.qty, e.price, e.market, e.tag = (
                 new.date, new.stk_cd, new.stk_nm, new.side, new.qty, new.price, new.market, new.tag)
-            save_ledger(self.ledger)
+            self._persist()
             self._reload_tree()
             win.destroy()
 
@@ -916,7 +929,7 @@ class ManualLedgerTab(ttk.Frame):
             entries, errs = parse_bulk_entries(txt.get("1.0", "end"))
             if entries:
                 self.ledger.entries.extend(entries)
-                save_ledger(self.ledger)
+                self._persist()
                 self._reload_tree()
             msg = f"{len(entries)}건 추가됨."
             if errs:
@@ -946,7 +959,7 @@ class ManualLedgerTab(ttk.Frame):
             return
         if entries:
             self.ledger.entries.extend(entries)
-            save_ledger(self.ledger)
+            self._persist()
             self._reload_tree()
         msg = f"{len(entries)}건 추가됨."
         if errs:
@@ -981,7 +994,7 @@ class ManualLedgerTab(ttk.Frame):
             return
         keep = [e for i, e in enumerate(self.ledger.entries) if str(i) not in sel]
         self.ledger.entries = keep
-        save_ledger(self.ledger)
+        self._persist()
         self._reload_tree()
 
     def _set_price(self) -> None:
@@ -993,7 +1006,7 @@ class ManualLedgerTab(ttk.Frame):
         except ValueError:
             messagebox.showerror("입력 오류", "현재가는 숫자여야 합니다.")
             return
-        save_ledger(self.ledger)
+        self._persist()
         self._refresh_price_label()
         self.px_code.set(""); self.px_value.set("")
 
@@ -1043,7 +1056,11 @@ class ManualLedgerTab(ttk.Frame):
     def _worker(self, cfg, ymd, fmt, do_fetch, entries) -> None:
         try:
             result = run_manual_journal(
-                cfg, ymd, fmt, do_fetch=do_fetch, entries=entries, log=self._log)
+                cfg, ymd, fmt, do_fetch=do_fetch, entries=entries,
+                ledger=self.ledger,
+                out_label=self.manual_tab.out_label_for(self.account_name),
+                account_no=f"수동 원장 · {self.account_name}",
+                log=self._log)
             self.after(0, self._on_done, result)
         except Exception as e:  # noqa: BLE001
             self._log(f"[error] {e}")
@@ -1075,6 +1092,321 @@ class ManualLedgerTab(ttk.Frame):
     def _open_dir(self) -> None:
         if self._result:
             _open_path(self._result.json_path.parent)
+
+
+class ManualLedgerTab(ttk.Frame):
+    """다계좌 수동 원장 컨테이너 — 계좌별 탭(＋로 추가) + 전 계좌 일괄 생성.
+
+    각 계좌 탭은 AccountLedgerFrame 으로, 자기 계좌만 생성한다. 컨테이너는
+    계좌 추가/이름변경/삭제, 전체 백업/복구, 전 계좌 개별·합산 생성을 담당한다.
+    """
+
+    _PLUS = "＋"
+
+    def __init__(self, master: ttk.Notebook, app: "App") -> None:
+        super().__init__(master, padding=PAD)
+        self.app = app
+        self.book: LedgerBook = load_book()
+        self.frames: dict[str, AccountLedgerFrame] = {}
+        self._building = False
+        self._last_dir: Path | None = None
+        self._build()
+        self._rebuild_tabs()
+
+    # ── 영속화 ─────────────────────────────────────────────────────────────
+    def _save_book(self) -> None:
+        try:
+            save_book(self.book)
+        except OSError as e:
+            messagebox.showerror("저장 실패", str(e))
+
+    def out_label_for(self, name: str) -> str:
+        """계좌명 → 출력 파일명 접미사(파일명 안전 문자만)."""
+        safe = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+        return f"manual_{safe or 'acct'}"
+
+    # ── UI ─────────────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # 계좌 관리 툴바
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, sticky="we", pady=(0, PAD))
+        ttk.Label(bar, text="계좌").pack(side="left", padx=(0, PAD))
+        ttk.Button(bar, text="＋ 계좌 추가", command=self._add_account).pack(side="left")
+        ttk.Button(bar, text="이름변경", command=self._rename_account).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="계좌 삭제", command=self._delete_account).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="전체 백업...", command=self._backup_book).pack(side="left", padx=(PAD * 2, 0))
+        ttk.Button(bar, text="전체 복구...", command=self._restore_book).pack(side="left", padx=(PAD, 0))
+
+        # 계좌 탭 (＋ 탭 포함)
+        self.nb = ttk.Notebook(self)
+        self.nb.grid(row=1, column=0, sticky="nsew")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_sub_tab)
+
+        # 전 계좌 일괄 생성
+        gen = ttk.LabelFrame(self, text="전 계좌 매매일지 생성", padding=PAD)
+        gen.grid(row=2, column=0, sticky="we", pady=(PAD, 0))
+        self.gen_date = StringVar(value=today_ymd())
+        self.gen_fmt = StringVar(value="md")
+        self.gen_fetch = BooleanVar(value=True)
+        ttk.Label(gen, text="기준일(YYYYMMDD)").grid(row=0, column=0, padx=2, sticky="w")
+        ttk.Entry(gen, textvariable=self.gen_date, width=10).grid(row=0, column=1, padx=2)
+        ttk.Radiobutton(gen, text="MD", variable=self.gen_fmt, value="md").grid(row=0, column=2, padx=2)
+        ttk.Radiobutton(gen, text="PDF", variable=self.gen_fmt, value="pdf").grid(row=0, column=3, padx=2)
+        ttk.Radiobutton(gen, text="둘 다", variable=self.gen_fmt, value="both").grid(row=0, column=4, padx=2)
+        ttk.Checkbutton(gen, text="자동 시세조회", variable=self.gen_fetch).grid(row=0, column=5, padx=(PAD, 2))
+        self.batch_indiv_btn = ttk.Button(
+            gen, text="전 계좌 개별생성", command=lambda: self._generate_all(False))
+        self.batch_indiv_btn.grid(row=1, column=0, columnspan=2, sticky="w", pady=(PAD, 0))
+        self.batch_combined_btn = ttk.Button(
+            gen, text="전 계좌 합산생성", command=lambda: self._generate_all(True))
+        self.batch_combined_btn.grid(row=1, column=2, columnspan=2, sticky="w", padx=2, pady=(PAD, 0))
+        self.open_dir_btn = ttk.Button(gen, text="폴더 열기", command=self._open_dir, state="disabled")
+        self.open_dir_btn.grid(row=1, column=4, padx=2, pady=(PAD, 0))
+        ttk.Label(gen, text="개별=계좌마다 별도 일지 · 합산=모든 계좌를 합쳐 1개(같은 종목은 합산)",
+                  style="Hint.TLabel").grid(row=2, column=0, columnspan=6, sticky="w", pady=(2, 0))
+
+        # 공용 로그
+        self.log = ScrolledText(self, height=6, font=("Menlo", 10))
+        self.log.grid(row=3, column=0, sticky="we", pady=(PAD, 0))
+        self.log.configure(state="disabled")
+
+    # ── 탭 관리 ────────────────────────────────────────────────────────────
+    def _rebuild_tabs(self) -> None:
+        self._building = True
+        for tab in list(self.nb.tabs()):
+            self.nb.forget(tab)
+        self.frames.clear()
+        for name, ledger in self.book.accounts.items():
+            fr = AccountLedgerFrame(self.nb, self.app, self, name, ledger)
+            self.frames[name] = fr
+            self.nb.add(fr, text=name)
+        self._plus_frame = ttk.Frame(self.nb)
+        self.nb.add(self._plus_frame, text=self._PLUS)
+        self._building = False
+        self._select_account(self.book.active)
+
+    def _select_account(self, name: str) -> None:
+        fr = self.frames.get(name)
+        if fr is not None:
+            self.nb.select(fr)
+
+    def _on_sub_tab(self, _event=None) -> None:
+        if self._building:
+            return
+        try:
+            cur = self.nb.nametowidget(self.nb.select())
+        except Exception:  # noqa: BLE001
+            return
+        if cur is getattr(self, "_plus_frame", None):
+            self._add_account()
+            return
+        for name, fr in self.frames.items():
+            if fr is cur:
+                if self.book.active != name:
+                    self.book.active = name
+                    self._save_book()
+                break
+
+    def _ask_name(self, title: str, initial: str = "") -> str | None:
+        name = simpledialog.askstring(title, "계좌 이름:", initialvalue=initial, parent=self)
+        if name is None:
+            return None
+        name = name.strip()
+        if not name:
+            return None
+        if name == self._PLUS or name in self.book.accounts:
+            messagebox.showerror(title, "이미 있거나 사용할 수 없는 이름입니다.")
+            return None
+        return name
+
+    def _add_account(self) -> None:
+        name = self._ask_name("계좌 추가")
+        if name is None:
+            self._select_account(self.book.active)   # 취소·실패 → 원래 탭 복귀
+            return
+        self.book.accounts[name] = Ledger()
+        self.book.active = name
+        self._save_book()
+        self._rebuild_tabs()
+
+    def _rename_account(self) -> None:
+        old = self.book.active
+        name = self._ask_name("계좌 이름변경", initial=old)
+        if name is None:
+            return
+        # 삽입 순서(탭 순서) 보존하며 키만 교체
+        self.book.accounts = {
+            (name if k == old else k): v for k, v in self.book.accounts.items()
+        }
+        self.book.active = name
+        self._save_book()
+        self._rebuild_tabs()
+
+    def _delete_account(self) -> None:
+        if len(self.book.accounts) <= 1:
+            messagebox.showinfo("계좌 삭제", "마지막 계좌는 삭제할 수 없습니다.")
+            return
+        name = self.book.active
+        if not messagebox.askyesno("계좌 삭제", f"'{name}' 계좌와 원장을 삭제할까요?"):
+            return
+        del self.book.accounts[name]
+        self.book.active = next(iter(self.book.accounts))
+        self._save_book()
+        self._rebuild_tabs()
+
+    # ── 전체 백업/복구 ──────────────────────────────────────────────────────
+    def _backup_book(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="원장 전체 백업 저장",
+            defaultextension=".json",
+            initialfile="invest-retrospect-ledger.json",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            export_book(self.book, Path(path))
+        except OSError as e:
+            messagebox.showerror("백업 실패", str(e))
+            return
+        n_ent = sum(len(l.entries) for l in self.book.accounts.values())
+        messagebox.showinfo(
+            "백업 완료",
+            f"계좌 {len(self.book.accounts)}개 · 거래 {n_ent}건을 백업했습니다.\n{path}",
+        )
+
+    def _restore_book(self) -> None:
+        path = filedialog.askopenfilename(
+            title="원장 전체 복구 — 백업 파일 선택",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            restored = import_book(Path(path))
+        except OSError as e:
+            messagebox.showerror("복구 실패", f"파일을 읽을 수 없습니다.\n{e}")
+            return
+        except ValueError as e:
+            # json.JSONDecodeError 포함 — 형식이 올바르지 않은 파일
+            messagebox.showerror("복구 실패", f"올바른 원장 백업 파일이 아닙니다.\n{e}")
+            return
+        cur_ent = sum(len(l.entries) for l in self.book.accounts.values())
+        new_ent = sum(len(l.entries) for l in restored.accounts.values())
+        if not messagebox.askyesno(
+            "원장 전체 복구",
+            f"현재 전체 원장(계좌 {len(self.book.accounts)}개·거래 {cur_ent}건)을\n"
+            f"백업 내용(계좌 {len(restored.accounts)}개·거래 {new_ent}건)으로 덮어씁니다.\n"
+            "기존 원장은 자동 백업본으로 보존됩니다. 계속할까요?",
+        ):
+            return
+        # 덮어쓰기 전 자동 백업 — 타임스탬프로 누적 보존
+        if any(l.entries or l.prices for l in self.book.accounts.values()):
+            from datetime import datetime
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            auto = MANUAL_LEDGER_PATH.with_name(f"manual_ledger.{stamp}.bak.json")
+            try:
+                export_book(self.book, auto)
+            except OSError as e:
+                if not messagebox.askyesno(
+                    "자동 백업 실패",
+                    f"기존 원장 자동 백업에 실패했습니다.\n{e}\n\n"
+                    "문제가 생겨도 기존 원장을 되돌리기 어려울 수 있습니다. "
+                    "그래도 복구를 계속할까요?",
+                ):
+                    return
+        self.book = restored
+        self._save_book()
+        self._rebuild_tabs()
+        messagebox.showinfo(
+            "복구 완료",
+            f"계좌 {len(restored.accounts)}개 · 거래 {new_ent}건을 복구했습니다.",
+        )
+
+    # ── 전 계좌 생성 ───────────────────────────────────────────────────────
+    def _append_log(self, msg: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _log(self, msg: str) -> None:
+        self.after(0, self._append_log, msg)
+
+    def _set_batch_state(self, state: str) -> None:
+        self.batch_indiv_btn.configure(state=state)
+        self.batch_combined_btn.configure(state=state)
+
+    def _generate_all(self, combined: bool) -> None:
+        self.app.flush_save()
+        accounts = [(n, l) for n, l in self.book.accounts.items() if l.entries]
+        if not accounts:
+            messagebox.showinfo("원장 비어 있음", "거래가 있는 계좌가 없습니다.")
+            return
+        try:  # broker 를 manual 로 강제 → 활성 증권사 키 검증 우회
+            cfg = config_from_settings(replace(self.app.settings, broker="manual"))
+        except RuntimeError as e:
+            messagebox.showerror("설정 오류", str(e))
+            return
+        ymd = self.gen_date.get().strip()
+        fmt = self.gen_fmt.get()
+        do_fetch = self.gen_fetch.get()
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._set_batch_state("disabled")
+        self.open_dir_btn.configure(state="disabled")
+        threading.Thread(
+            target=self._batch_worker,
+            args=(cfg, ymd, fmt, do_fetch, combined, accounts),
+            daemon=True,
+        ).start()
+
+    def _batch_worker(self, cfg, ymd, fmt, do_fetch, combined, accounts) -> None:
+        try:
+            if combined:
+                merged = Ledger()
+                for _n, l in accounts:
+                    merged.entries.extend(l.entries)
+                    merged.prices.update(l.prices)
+                self._log(f"[합산] {len(accounts)}개 계좌 · 거래 {len(merged.entries)}건 통합 생성...")
+                run_manual_journal(
+                    cfg, ymd, fmt, do_fetch=do_fetch, ledger=merged,
+                    out_label="manual_all", account_no="수동 원장 · 전체 합산",
+                    log=self._log)
+                self._log("[합산] 완료")
+            else:
+                total = len(accounts)
+                for i, (name, ledger) in enumerate(accounts, 1):
+                    self._log(f"[{i}/{total}] '{name}' 계좌 생성...")
+                    run_manual_journal(
+                        cfg, ymd, fmt, do_fetch=do_fetch, ledger=ledger,
+                        out_label=self.out_label_for(name),
+                        account_no=f"수동 원장 · {name}", log=self._log)
+                self._log("[개별] 전 계좌 완료")
+            # 공유 상태(_last_dir)·위젯 변경은 메인 스레드에서만 수행
+            self.after(0, self._on_batch_done, cfg.journal_dir)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[error] {e}")
+            self._log(traceback.format_exc())
+            self.after(0, lambda err=e: self._on_batch_error(err))
+
+    def _on_batch_done(self, journal_dir: Path) -> None:
+        self._last_dir = journal_dir
+        self._set_batch_state("normal")
+        self.open_dir_btn.configure(state="normal")
+
+    def _on_batch_error(self, exc: Exception) -> None:
+        self._set_batch_state("normal")
+        messagebox.showerror("생성 실패", str(exc))
+
+    def _open_dir(self) -> None:
+        target = self._last_dir or self.app.settings.journal_dir
+        if target:
+            _open_path(Path(target))
 
 
 class MarketTab(ttk.Frame):

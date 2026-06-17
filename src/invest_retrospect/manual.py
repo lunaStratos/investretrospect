@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -72,6 +73,64 @@ class Ledger:
     def to_dict(self) -> dict[str, Any]:
         return {"entries": [e.to_dict() for e in self.entries], "prices": self.prices}
 
+    @classmethod
+    def from_dict(cls, data: Any) -> "Ledger":
+        """{entries:[...], prices:{...}} dict 를 Ledger 로. 형식이 다르면 ValueError."""
+        if not isinstance(data, dict):
+            raise ValueError("올바른 원장 백업 파일이 아닙니다.")
+        entries = [
+            LedgerEntry.from_dict(d)
+            for d in (data.get("entries") or [])
+            if isinstance(d, dict)
+        ]
+        raw_prices = data.get("prices") or {}
+        prices_map = {str(k): float(v) for k, v in raw_prices.items() if _is_num(v)}
+        return cls(entries=entries, prices=prices_map)
+
+
+# 다계좌 미사용 시(구버전 파일·신규 사용자)의 기본 계좌 이름
+DEFAULT_ACCOUNT = "기본"
+
+
+@dataclass
+class LedgerBook:
+    """여러 계좌(이름→원장)를 담는 묶음. dict 삽입순서 = 탭 순서."""
+
+    accounts: dict[str, Ledger] = field(
+        default_factory=lambda: {DEFAULT_ACCOUNT: Ledger()}
+    )
+    active: str = DEFAULT_ACCOUNT   # 현재 선택된 계좌 이름
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "accounts": {n: l.to_dict() for n, l in self.accounts.items()},
+            "active": self.active,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "LedgerBook":
+        """신 포맷({accounts,active})·구 포맷({entries,prices}) 모두 수용.
+
+        구 포맷(단일 원장)은 '기본' 계좌 하나로 자동 마이그레이션한다.
+        형식이 dict 가 아니면 ValueError.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("올바른 원장 백업 파일이 아닙니다.")
+        if isinstance(data.get("accounts"), dict):
+            accounts: dict[str, Ledger] = {}
+            for name, d in data["accounts"].items():
+                if isinstance(d, dict):
+                    accounts[str(name)] = Ledger.from_dict(d)
+            if not accounts:
+                accounts = {DEFAULT_ACCOUNT: Ledger()}
+            active = str(data.get("active") or "")
+            if active not in accounts:
+                active = next(iter(accounts))
+            return cls(accounts=accounts, active=active)
+        # 구 포맷: 단일 원장 → 기본 계좌로 이관
+        return cls(accounts={DEFAULT_ACCOUNT: Ledger.from_dict(data)},
+                   active=DEFAULT_ACCOUNT)
+
 
 # ── 저장/로드 ────────────────────────────────────────────────────────────────
 def _ledger_path() -> Path:
@@ -80,27 +139,71 @@ def _ledger_path() -> Path:
     return MANUAL_LEDGER_PATH
 
 
-def load_ledger() -> Ledger:
+def load_book() -> LedgerBook:
+    """전체 계좌 묶음을 로드. 파일이 없거나 깨지면 빈 묶음(기본 계좌 1개)."""
     path = _ledger_path()
     if not path.is_file():
-        return Ledger()
+        return LedgerBook()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return Ledger()
-    entries = [LedgerEntry.from_dict(d) for d in (data.get("entries") or []) if isinstance(d, dict)]
-    raw_prices = data.get("prices") or {}
-    prices_map = {str(k): float(v) for k, v in raw_prices.items() if _is_num(v)}
-    return Ledger(entries=entries, prices=prices_map)
+        return LedgerBook()
+    try:
+        return LedgerBook.from_dict(data)
+    except ValueError:
+        return LedgerBook()
+
+
+def save_book(book: LedgerBook) -> Path:
+    """전체 계좌 묶음을 원자적으로 저장한다.
+
+    임시 파일에 먼저 쓴 뒤 os.replace 로 교체해, 저장 도중 충돌/전원차단이
+    일어나도 기존 파일이 부분 기록으로 손상되지 않게 한다.
+    """
+    path = _ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    payload = json.dumps(book.to_dict(), ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)   # 같은 디렉토리 → 원자적 교체
+    return path
+
+
+def load_ledger() -> Ledger:
+    """활성 계좌의 원장 (CLI·단일 계좌 호환용)."""
+    book = load_book()
+    return book.accounts.get(book.active) or Ledger()
 
 
 def save_ledger(ledger: Ledger) -> Path:
-    path = _ledger_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(ledger.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    """활성 계좌의 원장만 갱신해 묶음 전체를 저장 (CLI·단일 계좌 호환용)."""
+    book = load_book()
+    book.accounts[book.active] = ledger
+    return save_book(book)
+
+
+def export_book(book: LedgerBook, dest: Path) -> Path:
+    """전체 계좌 묶음을 지정 경로에 JSON 으로 백업한다."""
+    dest = Path(dest)
+    if dest.parent and not dest.parent.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps(book.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return path
+    return dest
+
+
+def import_book(src: Path) -> LedgerBook:
+    """백업 JSON 파일에서 전체 계좌 묶음을 복원한다.
+
+    구버전 단일 원장 백업도 '기본' 계좌로 수용한다. 파일이 없으면 OSError,
+    JSON 형식이 아니면 json.JSONDecodeError/ValueError 를 올린다.
+    """
+    data = json.loads(Path(src).read_text(encoding="utf-8"))
+    return LedgerBook.from_dict(data)
 
 
 def _is_num(v: Any) -> bool:
@@ -319,6 +422,7 @@ def build_manual_daily(
     entries: list[LedgerEntry],
     cur_prices: dict[str, float] | None = None,
     fx: dict[str, float] | None = None,
+    account_no: str = "수동 원장",
 ) -> DailyJournalData:
     """원장 + 현재가 → DailyJournalData (기존 렌더 파이프라인과 호환)."""
     cur_prices = cur_prices or {}
@@ -375,7 +479,7 @@ def build_manual_daily(
 
     return DailyJournalData(
         date=ymd_dashed(date_ymd),
-        account_no="수동 원장",
+        account_no=account_no,
         trades=trades,
         stock_pls=sorted(stock_pls, key=lambda s: s.realized_pl, reverse=True),
         holdings=sorted(holdings, key=lambda h: h.eval_amt, reverse=True),
@@ -422,11 +526,16 @@ def run_manual_journal(
     *,
     do_fetch: bool = True,
     entries: list[LedgerEntry] | None = None,
+    ledger: Ledger | None = None,
+    out_label: str = "manual",
+    account_no: str = "수동 원장",
     log: LogFn | None = None,
 ) -> JournalResult:
     """수동 원장 매매일지 생성. cfg 는 AI/journal_dir/시세키 용도로 사용.
 
-    entries 가 주어지면 그 부분집합만으로 재생(체크된 항목만 생성용).
+    ledger 가 주어지면 해당 계좌 원장을 쓰고(없으면 활성 계좌), entries 가
+    주어지면 그 부분집합만으로 재생(체크된 항목만 생성용). out_label 은 출력
+    파일명 접미사(계좌별 충돌 방지), account_no 는 일지에 표기될 계좌명.
     """
     log = log or (lambda _m: None)
     if fmt not in ("md", "pdf", "both"):
@@ -434,7 +543,7 @@ def run_manual_journal(
     if len(ymd) != 8 or not ymd.isdigit():
         raise RuntimeError(f"날짜 형식 오류: {ymd} (YYYYMMDD 필요)")
 
-    ledger = load_ledger()
+    ledger = ledger if ledger is not None else load_ledger()
     use_entries = ledger.entries if entries is None else entries
     if not use_entries:
         raise RuntimeError("대상 항목이 없습니다. [수동 원장] 탭에서 항목을 추가/선택하세요.")
@@ -478,7 +587,7 @@ def run_manual_journal(
     else:
         log("[2/4] 시세 조회 생략 (수동값/원가 사용)")
 
-    data = build_manual_daily(ymd, use_entries, cur_prices, fx)
+    data = build_manual_daily(ymd, use_entries, cur_prices, fx, account_no=account_no)
     log(f"  → 보유 {len(data.holdings)}종목, 당일 체결 {data.trade_count}건, "
         f"실현손익 {data.total_realized_pl:,}")
 
@@ -486,8 +595,8 @@ def run_manual_journal(
     commentary = _maybe_ai(cfg, data, log)
 
     log(f"[4/4] 출력 생성 ({fmt})...")
-    out_base = cfg.journal_dir / f"{ymd}_manual"
-    out_json = cfg.journal_dir / f"{ymd}_manual.json"
+    out_base = cfg.journal_dir / f"{ymd}_{out_label}"
+    out_json = cfg.journal_dir / f"{ymd}_{out_label}.json"
     cfg.journal_dir.mkdir(parents=True, exist_ok=True)
     snapshot = {
         "ymd": ymd,
@@ -506,7 +615,9 @@ def run_manual_journal(
 
 
 __all__ = [
-    "LedgerEntry", "Ledger", "load_ledger", "save_ledger",
+    "LedgerEntry", "Ledger", "LedgerBook", "DEFAULT_ACCOUNT",
+    "load_ledger", "save_ledger", "load_book", "save_book",
+    "export_book", "import_book",
     "parse_bulk_entries", "parse_excel_entries", "write_sample_xlsx", "BULK_HEADER",
     "build_manual_daily", "held_symbols", "run_manual_journal", "today_ymd",
 ]
