@@ -108,6 +108,30 @@ def save_settings(s: Settings) -> Path:
     return SETTINGS_PATH
 
 
+def export_settings(s: Settings, dest: Path) -> Path:
+    """현재 설정을 지정 경로에 JSON 으로 백업한다."""
+    dest = Path(dest)
+    if dest.parent and not dest.parent.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        json.dumps(asdict(s), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return dest
+
+
+def import_settings(src: Path) -> Settings:
+    """백업 JSON 파일에서 설정을 읽어 Settings 로 복원한다.
+
+    알 수 없는 키는 무시하고 load_settings 와 동일한 검증 규칙을 적용한다.
+    파일이 없거나(OSError) JSON 형식이 아니면(JSONDecode/ValueError) 예외를 올린다.
+    """
+    data = json.loads(Path(src).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("올바른 설정 백업 파일이 아닙니다.")
+    allowed = {f.name for f in fields(Settings)}
+    return Settings(**{k: v for k, v in data.items() if k in allowed and isinstance(v, str)})
+
+
 def account_no_for(s: Settings, broker: Broker) -> str:
     if broker is Broker.KIWOOM:
         return s.kiwoom_account_no

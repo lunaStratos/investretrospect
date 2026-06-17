@@ -44,6 +44,8 @@ from invest_retrospect.settings_store import (
     Settings,
     config_from_settings,
     default_journal_dir,
+    export_settings,
+    import_settings,
     load_settings,
     save_settings,
 )
@@ -171,6 +173,7 @@ class SettingsTab(ttk.Frame):
         self.app = app
         self._entries: dict[str, ttk.Entry] = {}
         self._labels: dict[str, ttk.Label] = {}
+        self._reveal_checks: dict[str, ttk.Checkbutton] = {}
         self._broker_boxes: dict[Broker, ttk.LabelFrame] = {}
         self._build_scroll()       # self.body (스크롤되는 내부 프레임) 생성
         self._build()
@@ -203,6 +206,16 @@ class SettingsTab(ttk.Frame):
         ent.grid(row=r, column=1, sticky="we", padx=PAD, pady=2)
         self._entries[key] = ent
         self._labels[key] = lbl
+        # 마스킹 필드(secret/비밀번호)에는 평문 표시 토글 체크박스를 추가한다.
+        if show:
+            reveal_var = BooleanVar(value=False)
+
+            def _toggle(v=reveal_var, e=ent, s=show) -> None:
+                e.configure(show="" if v.get() else s)
+
+            chk = ttk.Checkbutton(parent, text="표시", variable=reveal_var, command=_toggle)
+            chk.grid(row=r, column=2, sticky="w", padx=(0, PAD), pady=2)
+            self._reveal_checks[key] = chk
         return ent
 
     def _build(self) -> None:
@@ -300,6 +313,22 @@ class SettingsTab(ttk.Frame):
         ttk.Button(obox, text="찾아보기...", command=self._pick_dir).grid(row=0, column=2, padx=PAD)
         row += 1
 
+        # ── 백업 / 복구 ───────────────────────────────────────────────────
+        bkbox = ttk.LabelFrame(self.body, text="설정 백업 / 복구", padding=PAD)
+        bkbox.grid(row=row, column=0, sticky="we", pady=(0, PAD))
+        ttk.Button(bkbox, text="설정 백업...", command=self._backup_settings).grid(
+            row=0, column=0, sticky="w", padx=PAD, pady=2
+        )
+        ttk.Button(bkbox, text="설정 복구...", command=self._restore_settings).grid(
+            row=0, column=1, sticky="w", padx=PAD, pady=2
+        )
+        ttk.Label(
+            bkbox,
+            text="모든 증권사 키·계좌·AI·출력 설정을 JSON 파일로 내보내거나 불러옵니다.",
+            foreground="#888",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=PAD, pady=(2, 0))
+        row += 1
+
         # 하단: 자동 저장 안내
         ttk.Label(
             self.body,
@@ -319,6 +348,8 @@ class SettingsTab(ttk.Frame):
                     self._entries[k].configure(state=state)
                 if k in self._labels:
                     self._labels[k].configure(foreground="" if enabled else "#999")
+                if k in self._reveal_checks:
+                    self._reveal_checks[k].configure(state=state)
 
         apply(self.GEMINI_KEYS, gemini_on)
         apply(self.OLLAMA_KEYS, ollama_on)
@@ -337,6 +368,8 @@ class SettingsTab(ttk.Frame):
                     self._entries[key].configure(state=state)
                 if key in self._labels:
                     self._labels[key].configure(foreground="" if active else "#999")
+                if key in self._reveal_checks:
+                    self._reveal_checks[key].configure(state=state)
 
     def _pick_dir(self) -> None:
         var = self.app.setting_vars["journal_dir"]
@@ -344,6 +377,50 @@ class SettingsTab(ttk.Frame):
         chosen = filedialog.askdirectory(initialdir=current, title="저장 디렉토리 선택")
         if chosen:
             var.set(chosen)
+
+    def _backup_settings(self) -> None:
+        """현재 입력 중인 모든 설정을 JSON 파일로 내보낸다."""
+        self.app.flush_save()
+        path = filedialog.asksaveasfilename(
+            title="설정 백업 저장",
+            defaultextension=".json",
+            initialfile="invest-retrospect-settings.json",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            current = Settings(**{k: v.get() for k, v in self.app.setting_vars.items()})
+            export_settings(current, Path(path))
+        except OSError as e:
+            messagebox.showerror("백업 실패", str(e))
+            return
+        messagebox.showinfo("백업 완료", f"설정을 백업했습니다.\n{path}")
+
+    def _restore_settings(self) -> None:
+        """백업 JSON 파일을 읽어 모든 설정을 덮어쓴다."""
+        path = filedialog.askopenfilename(
+            title="설정 복구 — 백업 파일 선택",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            restored = import_settings(Path(path))
+        except OSError as e:
+            messagebox.showerror("복구 실패", f"파일을 읽을 수 없습니다.\n{e}")
+            return
+        except ValueError as e:
+            # json.JSONDecodeError 포함 — 형식이 올바르지 않은 파일
+            messagebox.showerror("복구 실패", f"올바른 설정 백업 파일이 아닙니다.\n{e}")
+            return
+        if not messagebox.askyesno(
+            "설정 복구",
+            "현재 설정을 백업 파일 내용으로 덮어씁니다. 계속할까요?",
+        ):
+            return
+        self.app.apply_settings(restored)
+        messagebox.showinfo("복구 완료", "설정을 복구했습니다.")
 
 
 class JournalTab(ttk.Frame):
@@ -1230,6 +1307,12 @@ class App(Tk):
             return
         self.settings = new
         self.status_var.set("✓ 저장됨")
+
+    def apply_settings(self, new: Settings) -> None:
+        """복구 등으로 받은 Settings 를 모든 입력 위젯에 반영하고 즉시 저장한다."""
+        for name, var in self.setting_vars.items():
+            var.set(getattr(new, name))
+        self.flush_save()
 
     def flush_save(self) -> None:
         if self._save_after_id is not None:
