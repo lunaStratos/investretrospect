@@ -11,6 +11,7 @@ dependencies = [
     "reportlab>=4.0",
     "openpyxl>=3.1",          # 수동 원장 엑셀(.xlsx) 업로드/샘플 다운로드
     "beautifulsoup4>=4.12",   # 시장 대시보드: 네이버 금융 HTML(EUC-KR) 파싱
+    "sv-ttk>=2.6",            # GUI 테마: Sun Valley(Windows 11 Fluent) 다크/라이트
 
     # 대신증권 CYBOS Plus 연동용 — Windows + 32-bit Python 환경에서만 필요/설치됨.
     "pywin32>=306; sys_platform == 'win32'",

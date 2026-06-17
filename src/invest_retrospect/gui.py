@@ -18,6 +18,7 @@ from tkinter import (
     Canvas,
     PhotoImage,
     StringVar,
+    TclError,
     Tk,
     Toplevel,
     filedialog,
@@ -58,16 +59,38 @@ _BROKER_PORTALS: dict[Broker, str] = {
 
 PAD = 6
 AUTOSAVE_DELAY_MS = 500
-
-# 한국 증시 색상 (상승=빨강, 하락=파랑, 보합=회색)
-_CLR_UP = "#d60000"
-_CLR_DOWN = "#0044cc"
-_CLR_FLAT = "#555555"
 _MARKET_REFRESH_SEC = 20
 
 
+# ── 테마 팔레트 ────────────────────────────────────────────────────────────
+class _Palette:
+    def __init__(self, **kw) -> None:
+        self.__dict__.update(kw)
+
+
+# 한국 증시 색상(상승/하락/보합)은 테마별로 명도를 달리한다 (다크에서는 밝게).
+_LIGHT = _Palette(
+    bg="#f4f4f4", fg="#1a1a1a", entry_bg="#ffffff", disabled_fg="#9a9a9a",
+    select_bg="#cfe2ff", select_fg="#1a1a1a", border="#bfbfbf",
+    button="#e6e6e6", button_active="#d7d7d7", tab_bg="#dedede",
+    trough="#d0d0d0", heading_bg="#e6e6e6", hint="#888888",
+    up="#d60000", down="#0044cc", flat="#555555",
+)
+_DARK = _Palette(
+    bg="#1e1e1e", fg="#e4e4e4", entry_bg="#2b2b2b", disabled_fg="#6a6a6a",
+    select_bg="#3a5f8a", select_fg="#ffffff", border="#3c3c3c",
+    button="#333333", button_active="#454545", tab_bg="#2a2a2a",
+    trough="#2b2b2b", heading_bg="#333333", hint="#9a9a9a",
+    up="#ff6b6b", down="#5a9bff", flat="#9a9a9a",
+)
+_PALETTES = {"light": _LIGHT, "dark": _DARK}
+
+# 현재 활성 팔레트 (라벨/트리 색상 함수가 참조). 테마 적용 시 갱신된다.
+_CUR = _LIGHT
+
+
 def _dir_color(direction: str) -> str:
-    return {market.UP: _CLR_UP, market.DOWN: _CLR_DOWN}.get(direction, _CLR_FLAT)
+    return {market.UP: _CUR.up, market.DOWN: _CUR.down}.get(direction, _CUR.flat)
 
 
 def _sign_dir(s: str) -> str:
@@ -247,6 +270,16 @@ class SettingsTab(ttk.Frame):
         )
         row += 1
 
+        # ── 화면 테마 ─────────────────────────────────────────────────────
+        vbox = ttk.LabelFrame(self.body, text="화면", padding=PAD)
+        vbox.grid(row=row, column=0, sticky="we", pady=(0, PAD))
+        self._dark_var = BooleanVar(value=self.app.setting_vars["theme"].get() == "dark")
+        ttk.Checkbutton(
+            vbox, text="다크 모드", variable=self._dark_var,
+            command=lambda: self.app.set_theme("dark" if self._dark_var.get() else "light"),
+        ).grid(row=0, column=0, sticky="w", padx=PAD, pady=2)
+        row += 1
+
         # ── broker 별 키 입력 박스 (전부 표시, 선택된 것만 강조) ──────────
         for b, spec in _BROKER_BOXES.items():
             box = ttk.LabelFrame(self.body, text=str(spec["label"]), padding=PAD)
@@ -277,7 +310,7 @@ class SettingsTab(ttk.Frame):
         ttk.Label(
             pbox,
             text="한투/키움 선택 시 해당 증권사 APP KEY/SECRET 필수 · 해외주식은 항상 Yahoo",
-            foreground="#888",
+            style="Hint.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         row += 1
 
@@ -325,7 +358,7 @@ class SettingsTab(ttk.Frame):
         ttk.Label(
             bkbox,
             text="모든 증권사 키·계좌·AI·출력 설정을 JSON 파일로 내보내거나 불러옵니다.",
-            foreground="#888",
+            style="Hint.TLabel",
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=PAD, pady=(2, 0))
         row += 1
 
@@ -333,7 +366,7 @@ class SettingsTab(ttk.Frame):
         ttk.Label(
             self.body,
             text=f"저장 위치: {SETTINGS_PATH}  ·  변경 시 자동 저장",
-            foreground="#888",
+            style="Hint.TLabel",
         ).grid(row=row, column=0, sticky="w", pady=(PAD, 0))
 
     def _update_ai_state(self) -> None:
@@ -456,7 +489,7 @@ class JournalTab(ttk.Frame):
         self.rowconfigure(5, weight=1)
 
         self.broker_label_var = StringVar(value="증권사: -")
-        ttk.Label(self, textvariable=self.broker_label_var, foreground="#444").grid(
+        ttk.Label(self, textvariable=self.broker_label_var, style="Hint.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=PAD, pady=(0, PAD)
         )
 
@@ -661,7 +694,7 @@ class ManualLedgerTab(ttk.Frame):
         ttk.Label(pf, text="현재가").grid(row=0, column=2, padx=2)
         ttk.Entry(pf, textvariable=self.px_value, width=10).grid(row=0, column=3, padx=2)
         ttk.Button(pf, text="저장", command=self._set_price).grid(row=0, column=4, padx=(PAD, 2))
-        self.px_label = ttk.Label(pf, text="", foreground="#888")
+        self.px_label = ttk.Label(pf, text="", style="Hint.TLabel")
         self.px_label.grid(row=0, column=5, padx=PAD)
 
         # 생성
@@ -680,7 +713,7 @@ class ManualLedgerTab(ttk.Frame):
         ttk.Radiobutton(apif, text="한투(KIS)", variable=api_var, value="kis").pack(side="left", padx=(PAD, 0))
         ttk.Radiobutton(apif, text="키움", variable=api_var, value="kiwoom").pack(side="left", padx=(PAD, 0))
         ttk.Label(apif, text="(한투/키움은 [설정]에서 키 입력 · 해외는 항상 Yahoo)",
-                  foreground="#888").pack(side="left", padx=(PAD, 0))
+                  style="Hint.TLabel").pack(side="left", padx=(PAD, 0))
 
         ttk.Label(gen, text="기준일 (YYYYMMDD)").grid(row=1, column=0, padx=2, sticky="w")
         ttk.Entry(gen, textvariable=self.gen_date, width=10).grid(row=1, column=1, padx=2)
@@ -852,6 +885,7 @@ class ManualLedgerTab(ttk.Frame):
         btns.grid(row=len(fields), column=0, columnspan=2, sticky="e", padx=PAD, pady=PAD)
         ttk.Button(btns, text="저장", command=save).pack(side="right")
         ttk.Button(btns, text="취소", command=win.destroy).pack(side="right", padx=(0, PAD))
+        self.app._recolor_classic(win)
         win.grab_set()
 
     def _bulk_paste(self) -> None:
@@ -865,7 +899,7 @@ class ManualLedgerTab(ttk.Frame):
             text="한 줄당 한 항목 · 컬럼 순서: 거래일  시장  종목명  코드  구분  수량  단가  (태그=선택)\n"
                  "탭 또는 콤마로 구분 (엑셀에서 복사하면 탭 구분).\n"
                  "예) 20260115\tKOSPI\t삼성전자\t005930\t매수\t10\t70000\t장투",
-            justify="left", foreground="#555",
+            justify="left", style="Hint.TLabel",
         ).pack(anchor="w", padx=PAD, pady=(PAD, 2))
         txt = ScrolledText(win, height=14, font=("Menlo", 11))
         txt.pack(fill="both", expand=True, padx=PAD, pady=2)
@@ -895,6 +929,7 @@ class ManualLedgerTab(ttk.Frame):
 
         ttk.Button(btns, text="가져오기", command=do_import).pack(side="right")
         ttk.Button(btns, text="닫기", command=win.destroy).pack(side="right", padx=(0, PAD))
+        self.app._recolor_classic(win)
 
     def _upload_excel(self) -> None:
         """.xlsx/.csv 파일을 골라 원장에 일괄 추가."""
@@ -1085,8 +1120,8 @@ class MarketTab(ttk.Frame):
             ttk.Radiobutton(bar, text=lbl, value=val, variable=self.market_var,
                             command=self._refresh).pack(side="left")
         ttk.Button(bar, text="새로고침", command=self._refresh).pack(side="left", padx=(PAD, 0))
-        ttk.Label(bar, textvariable=self.count_var, foreground="#888").pack(side="left", padx=(PAD, 0))
-        ttk.Label(bar, textvariable=self.status_var, foreground="#888").pack(side="right")
+        ttk.Label(bar, textvariable=self.count_var, style="Hint.TLabel").pack(side="left", padx=(PAD, 0))
+        ttk.Label(bar, textvariable=self.status_var, style="Hint.TLabel").pack(side="right")
 
         # 종합지수 카드
         self.idx_box = ttk.LabelFrame(self, text="종합지수", padding=PAD)
@@ -1114,14 +1149,22 @@ class MarketTab(ttk.Frame):
                 anchor = "w" if c == "종목" else ("center" if c in ("순위", "코드") else "e")
                 width = 150 if c == "종목" else (120 if c in ("시가총액",) else 80)
                 tree.column(c, width=width, anchor=anchor)
-            tree.tag_configure("up", foreground=_CLR_UP)
-            tree.tag_configure("down", foreground=_CLR_DOWN)
+            tree.tag_configure("up", foreground=_CUR.up)
+            tree.tag_configure("down", foreground=_CUR.down)
             tree.grid(row=0, column=0, sticky="nsew")
             sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             sb.grid(row=0, column=1, sticky="ns")
             tree.configure(yscrollcommand=sb.set)
             nb.add(frame, text=title)
             self._rank_trees[key] = (tree, kind)
+
+    def apply_theme(self) -> None:
+        """테마 변경 시 트리의 상승/하락 색상을 갱신 (기존 행도 즉시 반영)."""
+        for tree, _kind in self._rank_trees.values():
+            tree.tag_configure("up", foreground=_CUR.up)
+            tree.tag_configure("down", foreground=_CUR.down)
+        if self._active:   # 보이는 상태면 카드 색도 새로 그린다
+            self._refresh()
 
     # ── 가시성/자동 갱신 ───────────────────────────────────────────────────
     def set_active(self, active: bool) -> None:
@@ -1230,6 +1273,8 @@ class App(Tk):
         self.minsize(720, 640)
         self._apply_icon()
         self._enable_clipboard_shortcuts()
+        # 테마 엔진: sv-ttk(Sun Valley) 우선, 실패 시 clam 폴백 (_apply_theme 참고)
+        self._style = ttk.Style(self)
 
         self.settings = load_settings()
         # 모든 Settings 필드를 공유 StringVar 로 (탭 간 동기화 + 자동 저장 대상)
@@ -1259,13 +1304,130 @@ class App(Tk):
 
         status_bar = ttk.Frame(self)
         status_bar.pack(fill="x", padx=PAD, pady=(0, PAD))
-        ttk.Label(status_bar, textvariable=self.status_var, foreground="#666").pack(side="right")
+        ttk.Label(status_bar, textvariable=self.status_var, style="Hint.TLabel").pack(side="right")
 
         # 선택된 broker 의 키가 비어 있으면 설정 탭으로 시작
         if not self._active_broker_ready():
             nb.select(self.settings_tab)
 
+        # 저장된 테마 적용 (모든 위젯 생성 후 — 클래식 위젯 재색칠 포함)
+        initial = self.settings.theme if self.settings.theme in _PALETTES else "light"
+        self._apply_theme(initial)
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _apply_theme(self, name: str) -> None:
+        """Sun Valley(sv-ttk) 테마 적용 + 클래식 Tk 위젯 색 동기화.
+
+        sv-ttk 가 ttk 위젯을 Windows 11 Fluent 룩으로 그린다. 그 실제 색을
+        style.lookup 으로 읽어 ttk 가 아닌 위젯(Canvas/Text/Toplevel)에도 맞춘다.
+        sv-ttk 임포트 실패 시엔 clam 기반 폴백으로 동작한다.
+        """
+        global _CUR
+        if name not in _PALETTES:
+            name = "light"
+        pal = _PALETTES[name]
+        st = self._style
+        try:
+            import sv_ttk
+            sv_ttk.set_theme(name)
+            self.update_idletasks()   # 테마 색이 스타일 DB에 반영되도록 한 박자 대기
+            # 테마가 실제로 쓰는 색을 읽어 클래식 위젯과 정확히 맞춘다.
+            pal.bg = st.lookup("TFrame", "background") or st.lookup(".", "background") or pal.bg
+            pal.fg = st.lookup("TLabel", "foreground") or st.lookup(".", "foreground") or pal.fg
+            pal.entry_bg = (st.lookup("TEntry", "fieldbackground")
+                            or st.lookup(".", "fieldbackground") or pal.entry_bg)
+            st.configure("Hint.TLabel", background=pal.bg, foreground=pal.hint)
+        except Exception:  # noqa: BLE001  sv-ttk 미설치 등 — clam 폴백
+            self._apply_clam_theme(pal)
+
+        # 콤보박스 드롭다운(클래식 Listbox) 색
+        self.option_add("*TCombobox*Listbox.background", pal.entry_bg)
+        self.option_add("*TCombobox*Listbox.foreground", pal.fg)
+        self.option_add("*TCombobox*Listbox.selectBackground", pal.select_bg)
+        self.option_add("*TCombobox*Listbox.selectForeground", pal.select_fg)
+
+        _CUR = pal
+        self.configure(bg=pal.bg)
+        self._recolor_classic(self)
+        if hasattr(self, "market_tab"):
+            self.market_tab.apply_theme()
+
+    def _apply_clam_theme(self, pal: "_Palette") -> None:
+        """sv-ttk 를 못 쓸 때의 폴백 — clam 테마를 팔레트 색으로 직접 칠한다."""
+        st = self._style
+        try:
+            st.theme_use("clam")
+        except TclError:
+            return
+        st.configure(".", background=pal.bg, foreground=pal.fg,
+                     fieldbackground=pal.entry_bg, bordercolor=pal.border,
+                     lightcolor=pal.border, darkcolor=pal.border,
+                     troughcolor=pal.trough, insertcolor=pal.fg)
+        st.configure("TFrame", background=pal.bg)
+        st.configure("TLabel", background=pal.bg, foreground=pal.fg)
+        st.configure("Hint.TLabel", background=pal.bg, foreground=pal.hint)
+        st.configure("TLabelframe", background=pal.bg, bordercolor=pal.border)
+        st.configure("TLabelframe.Label", background=pal.bg, foreground=pal.fg)
+        st.configure("TButton", background=pal.button, foreground=pal.fg,
+                     bordercolor=pal.border, focuscolor=pal.border)
+        st.map("TButton",
+               background=[("pressed", pal.button_active), ("active", pal.button_active),
+                           ("disabled", pal.bg)],
+               foreground=[("disabled", pal.disabled_fg)])
+        for w in ("TCheckbutton", "TRadiobutton"):
+            st.configure(w, background=pal.bg, foreground=pal.fg, indicatorcolor=pal.entry_bg)
+            st.map(w, background=[("active", pal.bg)],
+                   foreground=[("disabled", pal.disabled_fg)],
+                   indicatorcolor=[("selected", pal.fg), ("disabled", pal.bg)])
+        st.configure("TEntry", fieldbackground=pal.entry_bg, foreground=pal.fg,
+                     insertcolor=pal.fg, bordercolor=pal.border)
+        st.map("TEntry", fieldbackground=[("disabled", pal.bg), ("readonly", pal.bg)],
+               foreground=[("disabled", pal.disabled_fg)])
+        st.configure("TCombobox", fieldbackground=pal.entry_bg, foreground=pal.fg,
+                     background=pal.button, arrowcolor=pal.fg, bordercolor=pal.border)
+        st.map("TCombobox",
+               fieldbackground=[("readonly", pal.entry_bg), ("disabled", pal.bg)],
+               foreground=[("disabled", pal.disabled_fg)],
+               selectbackground=[("readonly", pal.entry_bg)],
+               selectforeground=[("readonly", pal.fg)])
+        st.configure("TScrollbar", background=pal.button, troughcolor=pal.trough,
+                     bordercolor=pal.border, arrowcolor=pal.fg)
+        st.map("TScrollbar", background=[("active", pal.button_active)])
+        st.configure("TNotebook", background=pal.bg, bordercolor=pal.border)
+        st.configure("TNotebook.Tab", background=pal.tab_bg, foreground=pal.fg,
+                     padding=[10, 4], bordercolor=pal.border)
+        st.map("TNotebook.Tab", background=[("selected", pal.bg)],
+               foreground=[("selected", pal.fg), ("disabled", pal.disabled_fg)])
+        st.configure("Treeview", background=pal.entry_bg, fieldbackground=pal.entry_bg,
+                     foreground=pal.fg, bordercolor=pal.border)
+        st.map("Treeview", background=[("selected", pal.select_bg)],
+               foreground=[("selected", pal.select_fg)])
+        st.configure("Treeview.Heading", background=pal.heading_bg, foreground=pal.fg,
+                     bordercolor=pal.border)
+        st.map("Treeview.Heading", background=[("active", pal.button_active)])
+
+    def _recolor_classic(self, w) -> None:
+        """ttk 가 아닌 클래식 Tk 위젯(Canvas/Text/Toplevel)을 팔레트 색으로 칠한다."""
+        cls = w.winfo_class()
+        try:
+            if cls == "Canvas":
+                w.configure(bg=_CUR.bg, highlightthickness=0)
+            elif cls in ("Text", "Listbox"):
+                w.configure(bg=_CUR.entry_bg, fg=_CUR.fg, insertbackground=_CUR.fg,
+                            selectbackground=_CUR.select_bg, selectforeground=_CUR.select_fg,
+                            highlightthickness=0)
+            elif cls in ("Toplevel", "Tk"):
+                w.configure(bg=_CUR.bg)
+        except TclError:
+            pass
+        for c in w.winfo_children():
+            self._recolor_classic(c)
+
+    def set_theme(self, name: str) -> None:
+        """설정 탭 토글에서 호출 — 테마를 적용하고 설정에 저장(자동 저장 트리거)."""
+        self.setting_vars["theme"].set(name)
+        self._apply_theme(name)
 
     def _on_tab_changed(self, _event=None) -> None:
         try:

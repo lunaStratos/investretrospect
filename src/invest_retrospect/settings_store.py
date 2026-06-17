@@ -46,6 +46,9 @@ class Settings:
     broker: str = "kiwoom"               # 'kiwoom' | 'kis' | 'ls'
     env: str = "mock"                    # 'mock' | 'prod'
 
+    # 화면 테마: 'light' | 'dark'
+    theme: str = "light"
+
     # 키움
     kiwoom_app_key: str = ""
     kiwoom_secret_key: str = ""
