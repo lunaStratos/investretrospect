@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/invest_retrospect/gui.py)",
+      "Bash(cmd.exe /c build_app.bat)",
+      "PowerShell(& cmd.exe /c \".\\\\build_app.bat\")",
+      "Bash(python -c ' *)",
+      "Bash(.venv/Scripts/python -c \"import sys; sys.path.insert\\(0,'src'\\); import invest_retrospect.gui; print\\('gui import OK'\\)\")",
+      "PowerShell(& cmd.exe /c \".\\\\build_app.bat\" 2>&1)",
+      "Bash(python -c \"import httpx; print\\('httpx ok', httpx.__version__\\)\")",
+      "Bash(python -c \"from src.invest_retrospect import prices; print\\('AAPL', prices.fetch_quote\\('AAPL'\\)\\); print\\('삼성', prices.fetch_quote\\('005930.KS'\\)\\); print\\('USD', prices.fetch_fx\\('USD'\\)\\)\")",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"https://query1.finance.yahoo.com/v8/finance/chart/AAPL?interval=1d&range=1d\" -UseBasicParsing -TimeoutSec 8; \"OK status=$\\($r.StatusCode\\) len=$\\($r.Content.Length\\)\" } catch { \"BLOCKED/FAIL: $\\($_.Exception.Message\\)\" })"
+    ]
+  }
+}

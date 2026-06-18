@@ -37,10 +37,12 @@ from invest_retrospect.manual import (
     LedgerBook,
     LedgerEntry,
     export_book,
+    holdings_totals,
     import_book,
     load_book,
     parse_bulk_entries,
     parse_excel_entries,
+    resolve_current_prices,
     run_manual_journal,
     save_book,
     write_sample_xlsx,
@@ -219,8 +221,29 @@ class SettingsTab(ttk.Frame):
 
         self.body = ttk.Frame(canvas, padding=PAD * 2)
         win = canvas.create_window((0, 0), window=self.body, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        self.body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # 리사이즈 성능: 드래그 중 매 픽셀마다 bbox("all")(전체 위젯 O(N))를 다시
+        # 계산하고 본문 폭을 바꿔 재배치 피드백을 일으키면 느려진다. 폭은 실제로
+        # 변할 때만 반영하고, 스크롤 영역 재계산은 60ms 디바운스로 한 번만 한다.
+        self._scroll_after: str | None = None
+        self._canvas_w = -1
+
+        def _sync_region() -> None:
+            self._scroll_after = None
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e) -> None:
+            if e.width != self._canvas_w:
+                self._canvas_w = e.width
+                canvas.itemconfigure(win, width=e.width)
+
+        def _on_body_configure(_e) -> None:
+            if self._scroll_after is not None:
+                self.after_cancel(self._scroll_after)
+            self._scroll_after = self.after(60, _sync_region)
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        self.body.bind("<Configure>", _on_body_configure)
 
         # 포인터가 설정 영역 위에 있을 때만 휠 스크롤 (다른 탭/트리와 충돌 방지)
         def _wheel(e):
@@ -284,6 +307,15 @@ class SettingsTab(ttk.Frame):
             vbox, text="다크 모드", variable=self._dark_var,
             command=lambda: self.app.set_theme("dark" if self._dark_var.get() else "light"),
         ).grid(row=0, column=0, sticky="w", padx=PAD, pady=2)
+        self._lite_var = BooleanVar(
+            value=self.app.setting_vars["theme_engine"].get() == "lite")
+        ttk.Checkbutton(
+            vbox, text="가벼운 테마 (리사이즈·반응 빠름)", variable=self._lite_var,
+            command=lambda: self.app.set_theme_engine(self._lite_var.get()),
+        ).grid(row=0, column=1, sticky="w", padx=PAD, pady=2)
+        ttk.Label(vbox, text="화려한 Win11 룩 대신 가벼운 테마로 — 위젯이 많은 화면의 끊김 완화",
+                  style="Hint.TLabel").grid(row=1, column=0, columnspan=2, sticky="w",
+                                            padx=PAD, pady=(0, 2))
         row += 1
 
         # ── broker 별 키 입력 박스 (전부 표시, 선택된 것만 강조) ──────────
@@ -603,13 +635,13 @@ class JournalTab(ttk.Frame):
 class AccountLedgerFrame(ttk.Frame):
     """한 계좌의 수동 주식 원장: 매수/매도 변화 기록 → 임의 날짜 매매일지 생성."""
 
-    _COLS = ("check", "date", "market", "name", "code", "side", "qty", "price", "tag")
+    _COLS = ("check", "date", "market", "name", "code", "side", "qty", "price", "cur", "tag")
     _HEADS = {
         "check": "✓", "date": "거래일", "market": "시장", "name": "종목명", "code": "코드",
-        "side": "구분", "qty": "수량", "price": "단가", "tag": "태그",
+        "side": "구분", "qty": "수량", "price": "단가", "cur": "현재가", "tag": "태그",
     }
     _COL_W = {"check": 34, "date": 80, "market": 64, "name": 130, "code": 70,
-              "side": 50, "qty": 64, "price": 90, "tag": 70}
+              "side": 50, "qty": 64, "price": 90, "cur": 90, "tag": 70}
     _CHECK_ON, _CHECK_OFF = "☑", "☐"
 
     def __init__(self, master: ttk.Notebook, app: "App",
@@ -621,6 +653,7 @@ class AccountLedgerFrame(ttk.Frame):
         self.ledger: Ledger = ledger
         self._result: JournalResult | None = None
         self._checked: set[int] = set()    # 체크된 항목 (id(entry) 기준 — 객체 식별)
+        self._cur_prices: dict[str, float] = {}   # 조회된 현재가 {코드: 가격} (목록 표시용)
         self._build()
         self._reload_tree()
         self._refresh_price_label()
@@ -632,7 +665,9 @@ class AccountLedgerFrame(ttk.Frame):
     # ── UI ───────────────────────────────────────────────────────────────
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        # 목록 칸만 늘어나므로 minsize 로 바닥을 깔아 둔다 — 창이 짧아도
+        # 목록+버튼 줄(엑셀 업로드/샘플 다운로드 포함)이 0으로 찌그러지지 않게.
+        self.rowconfigure(2, weight=1, minsize=170)
 
         # 입력 폼
         form = ttk.LabelFrame(self, text="원장 항목 추가 (보유수량 변화)", padding=PAD)
@@ -694,8 +729,15 @@ class AccountLedgerFrame(ttk.Frame):
         ttk.Button(bar, text="전체 해제", command=lambda: self._check_all(False)).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="선택 항목 수정", command=self._edit_selected).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="선택 항목 삭제", command=self._delete_selected).pack(side="left", padx=(PAD, 0))
-        ttk.Button(bar, text="엑셀 업로드", command=self._upload_excel).pack(side="left", padx=(PAD, 0))
-        ttk.Button(bar, text="샘플 다운로드", command=self._download_sample).pack(side="left", padx=(PAD, 0))
+        self.fetch_px_btn = ttk.Button(bar, text="현재가 조회", command=self._fetch_prices)
+        self.fetch_px_btn.pack(side="left", padx=(PAD, 0))
+        # 업로드/샘플은 오른쪽 끝에 고정 — 버튼이 많아도 화면 밖으로 잘리지 않도록.
+        ttk.Button(bar, text="샘플 다운로드", command=self._download_sample).pack(side="right")
+        ttk.Button(bar, text="엑셀 업로드", command=self._upload_excel).pack(side="right", padx=(0, PAD))
+
+        # 현재가 조회 후 보유 평가총액·매입총액·평가손익 요약 (통화별, 손익은 등락색)
+        self.summary_frame = ttk.Frame(list_frame)
+        self.summary_frame.grid(row=2, column=0, columnspan=2, sticky="we", pady=(2, 0))
 
         # 수동 현재가(폴백)
         pf = ttk.LabelFrame(self, text="수동 현재가 (Yahoo/증권사 조회 실패 시 폴백)", padding=PAD)
@@ -748,7 +790,7 @@ class AccountLedgerFrame(ttk.Frame):
         self.open_dir_btn = ttk.Button(gen, text="폴더 열기", command=self._open_dir, state="disabled")
         self.open_dir_btn.grid(row=2, column=4, padx=2, pady=(PAD, 0))
 
-        self.log = ScrolledText(self, height=8, font=("Menlo", 10))
+        self.log = ScrolledText(self, height=5, font=("Menlo", 10))
         self.log.grid(row=5, column=0, sticky="nsew", pady=(PAD, 0))
         self.log.configure(state="disabled")
 
@@ -759,11 +801,44 @@ class AccountLedgerFrame(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for i, e in enumerate(self.ledger.entries):
             mark = self._CHECK_ON if id(e) in self._checked else self._CHECK_OFF
+            cur = self._cur_prices.get(e.stk_cd)
+            cur_txt = _fmt_price(cur) if cur is not None else ""
             self.tree.insert(
                 "", "end", iid=str(i),
                 values=(mark, e.date, e.market, e.stk_nm, e.stk_cd, e.side,
-                        f"{e.qty:,}", _fmt_price(e.price), e.tag),
+                        f"{e.qty:,}", _fmt_price(e.price), cur_txt, e.tag),
             )
+        self._render_summary()
+
+    def _render_summary(self) -> None:
+        """보유 종목 통화별 평가/매입/손익 요약을 목록 아래에 표시. 손익은 한국식
+        등락색(이익=빨강, 손실=파랑)으로 칠한다. 현재가가 없으면(조회 전) 비운다."""
+        for w in self.summary_frame.winfo_children():
+            w.destroy()
+        if not self._cur_prices:
+            return
+        totals = holdings_totals(self.ledger.entries, self._cur_prices, today_ymd())
+        row = 0
+        for ccy in sorted(totals, key=lambda c: (c != "KRW", c)):  # 원화 먼저
+            t = totals[ccy]
+            if not t.priced:
+                continue
+            dec = 0 if ccy == "KRW" else 2
+            sym = {"KRW": "₩", "USD": "$"}.get(ccy, f"{ccy} ")
+            gain = t.pl >= 0
+            sign = "+" if gain else "−"
+            prefix = (f"[{ccy}] 평가 {sym}{t.eval_amt:,.{dec}f} · "
+                      f"매입 {sym}{t.priced_cost:,.{dec}f} · 손익 ")
+            pl_txt = f"{sign}{sym}{abs(t.pl):,.{dec}f} ({sign}{abs(t.pl_pct):.2f}%)"
+            ttk.Label(self.summary_frame, text=prefix, style="Hint.TLabel").grid(
+                row=row, column=0, sticky="w")
+            ttk.Label(self.summary_frame, text=pl_txt,
+                      style="Gain.TLabel" if gain else "Loss.TLabel").grid(
+                row=row, column=1, sticky="w")
+            if t.priced != t.count:
+                ttk.Label(self.summary_frame, text=f"  ※{t.count - t.priced}종목 현재가 없음",
+                          style="Hint.TLabel").grid(row=row, column=2, sticky="w")
+            row += 1
 
     def _on_tree_click(self, event) -> None:
         """체크(✓) 열 클릭 시 해당 항목 체크 토글."""
@@ -987,6 +1062,62 @@ class AccountLedgerFrame(ttk.Frame):
             return
         if messagebox.askyesno("샘플 저장 완료", f"{out}\n\n파일을 여시겠습니까?"):
             _open_path(out)
+
+    # ── 현재가 조회 ────────────────────────────────────────────────────────
+    def _fetch_prices(self) -> None:
+        """원장의 모든 종목 현재가를 조회해 '현재가' 열에 표시 (해외=Yahoo, 국내=설정 API)."""
+        self.app.flush_save()
+        if not self.ledger.entries:
+            messagebox.showinfo("원장 비어 있음", "먼저 원장 항목을 추가하세요.")
+            return
+        try:  # broker 를 manual 로 강제 → 활성 증권사 키 검증 우회, 국내 API 검증만 적용
+            cfg = config_from_settings(replace(self.app.settings, broker="manual"))
+        except RuntimeError as e:
+            messagebox.showerror("설정 오류", str(e))
+            return
+        # 원장에 등장하는 모든 (코드, 시장) — resolve_current_prices 가 중복 제거.
+        symbols = [(e.stk_cd, e.market) for e in self.ledger.entries if e.stk_cd]
+        self.fetch_px_btn.configure(state="disabled")
+        self._log("[현재가] 조회 시작...")
+        threading.Thread(
+            target=self._fetch_prices_worker, args=(cfg, symbols), daemon=True
+        ).start()
+
+    def _fetch_prices_worker(self, cfg, symbols) -> None:
+        try:
+            prices_map = resolve_current_prices(
+                cfg, symbols, self.ledger.prices, do_fetch=True, log=self._log)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[error] 현재가 조회 실패: {e}")
+            self.after(0, self._on_fetch_prices_done, None, e)
+            return
+        self.after(0, self._on_fetch_prices_done, prices_map, None)
+
+    def _on_fetch_prices_done(self, prices_map, exc) -> None:
+        self.fetch_px_btn.configure(state="normal")
+        if exc is not None:
+            messagebox.showerror("현재가 조회 실패", str(exc))
+            return
+        self._cur_prices = prices_map or {}
+        self._reload_tree()
+        # 빈칸이 조용히 남지 않도록 성공/실패 종목 수를 명시한다.
+        codes = {e.stk_cd for e in self.ledger.entries if e.stk_cd}
+        got = sum(1 for c in codes if c in self._cur_prices)
+        miss = len(codes) - got
+        if codes and got == 0:
+            self._log("[현재가] 한 건도 가져오지 못했습니다 — 로그의 [warn] 원인을 확인하세요.")
+            messagebox.showwarning(
+                "현재가 조회 실패",
+                "시세를 한 건도 가져오지 못했습니다.\n\n"
+                "· 사내망/프록시가 Yahoo Finance 접속을 차단하거나\n"
+                "· 증권사(키움/한투) 인증이 실패했을 수 있습니다.\n\n"
+                "[매매일지 생성]의 '국내 시세 API'를 '야후'로 바꾸거나, "
+                "'수동 현재가'에 직접 입력해 보세요. 자세한 원인은 로그 창을 확인하세요.")
+        else:
+            msg = f"[현재가] {got}/{len(codes)}종목 조회 완료."
+            if miss:
+                msg += f" ({miss}종목 실패 → 빈칸/수동값)"
+            self._log(msg)
 
     def _delete_selected(self) -> None:
         sel = set(self.tree.selection())
@@ -1601,8 +1732,8 @@ class App(Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("매매 회고 (키움 / 한투 / LS / 메리츠 / 대신 / 수동)")
-        self.geometry("880x760")
-        self.minsize(720, 640)
+        self.geometry("880x840")
+        self.minsize(720, 700)
         self._apply_icon()
         self._enable_clipboard_shortcuts()
         # 테마 엔진: sv-ttk(Sun Valley) 우선, 실패 시 clam 폴백 (_apply_theme 참고)
@@ -1660,7 +1791,12 @@ class App(Tk):
             name = "light"
         pal = _PALETTES[name]
         st = self._style
+        # 'lite' 엔진이면 sv-ttk(이미지 기반, 리사이즈 무거움)를 건너뛰고
+        # 가벼운 clam 으로 직행한다.
+        lite = (self.setting_vars["theme_engine"].get() or "auto") == "lite"
         try:
+            if lite:
+                raise RuntimeError("lite theme engine")
             import sv_ttk
             sv_ttk.set_theme(name)
             self.update_idletasks()   # 테마 색이 스타일 DB에 반영되도록 한 박자 대기
@@ -1670,6 +1806,8 @@ class App(Tk):
             pal.entry_bg = (st.lookup("TEntry", "fieldbackground")
                             or st.lookup(".", "fieldbackground") or pal.entry_bg)
             st.configure("Hint.TLabel", background=pal.bg, foreground=pal.hint)
+            st.configure("Gain.TLabel", background=pal.bg, foreground=pal.up)
+            st.configure("Loss.TLabel", background=pal.bg, foreground=pal.down)
         except Exception:  # noqa: BLE001  sv-ttk 미설치 등 — clam 폴백
             self._apply_clam_theme(pal)
 
@@ -1699,6 +1837,8 @@ class App(Tk):
         st.configure("TFrame", background=pal.bg)
         st.configure("TLabel", background=pal.bg, foreground=pal.fg)
         st.configure("Hint.TLabel", background=pal.bg, foreground=pal.hint)
+        st.configure("Gain.TLabel", background=pal.bg, foreground=pal.up)
+        st.configure("Loss.TLabel", background=pal.bg, foreground=pal.down)
         st.configure("TLabelframe", background=pal.bg, bordercolor=pal.border)
         st.configure("TLabelframe.Label", background=pal.bg, foreground=pal.fg)
         st.configure("TButton", background=pal.button, foreground=pal.fg,
@@ -1760,6 +1900,11 @@ class App(Tk):
         """설정 탭 토글에서 호출 — 테마를 적용하고 설정에 저장(자동 저장 트리거)."""
         self.setting_vars["theme"].set(name)
         self._apply_theme(name)
+
+    def set_theme_engine(self, lite: bool) -> None:
+        """테마 엔진 전환(sv-ttk ↔ clam) — 자동 저장 트리거 후 즉시 재적용."""
+        self.setting_vars["theme_engine"].set("lite" if lite else "auto")
+        self._apply_theme(self.setting_vars["theme"].get())
 
     def _on_tab_changed(self, _event=None) -> None:
         try:

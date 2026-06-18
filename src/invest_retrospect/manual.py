@@ -25,8 +25,29 @@ from invest_retrospect.core import (
     today_ymd,
     ymd_dashed,
 )
+from invest_retrospect.settings_store import default_journal_dir
 
 LogFn = Callable[[str], None]
+
+
+def _writable_out_dir(preferred: Path, log: LogFn) -> Path:
+    """preferred 폴더에 실제로 파일을 쓸 수 있는지 시험하고, 막히면 기본 폴더로 폴백.
+
+    바탕화면 등은 Windows '제어된 폴더 액세스'(랜섬웨어 방지)가 서명 안 된 앱의
+    쓰기를 Errno 13(Permission denied)으로 막는다. 이때 매매일지 생성이 통째로
+    실패하지 않도록 ~/Documents/invest-retrospect 로 대체 저장한다.
+    """
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return preferred
+    except OSError as e:
+        fallback = default_journal_dir()
+        log(f"[warn] 출력 폴더 '{preferred}' 에 쓸 수 없습니다({e}) → '{fallback}' 에 저장합니다.")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 @dataclass
@@ -416,6 +437,46 @@ def held_symbols(entries: list[LedgerEntry], upto_ymd: str) -> list[tuple[str, s
     return [(code, p.market) for code, p in pos.items() if p.qty > 0]
 
 
+@dataclass
+class HoldingsTotal:
+    """통화별 보유 집계 (평가·매입·손익). priced<count 면 일부 종목 현재가 누락."""
+    currency: str
+    count: int = 0           # 보유 종목 수
+    priced: int = 0          # 현재가가 있는 종목 수
+    eval_amt: float = 0.0    # 평가총액 (현재가 있는 종목만)
+    priced_cost: float = 0.0  # 평가손익 기준 매입원가 (현재가 있는 종목의 잔여 취득원가)
+
+    @property
+    def pl(self) -> float:           # 평가손익 = 평가총액 − 매입원가
+        return self.eval_amt - self.priced_cost
+
+    @property
+    def pl_pct(self) -> float:       # 수익률 (%)
+        return (self.pl / self.priced_cost * 100.0) if self.priced_cost else 0.0
+
+
+def holdings_totals(
+    entries: list[LedgerEntry], cur_prices: dict[str, float], upto_ymd: str
+) -> dict[str, HoldingsTotal]:
+    """보유(qty>0) 종목을 통화별로 집계한다. 평가/매입/손익이 서로 맞물리도록
+    현재가가 없는 종목은 평가·매입 양쪽에서 모두 제외하고 count/priced 로 표시한다.
+    """
+    pos, _ = _replay(entries, upto_ymd)
+    out: dict[str, HoldingsTotal] = {}
+    for code, p in pos.items():
+        if p.qty <= 0:
+            continue
+        ccy = prices.currency_of(p.market)
+        t = out.setdefault(ccy, HoldingsTotal(currency=ccy))
+        t.count += 1
+        cur = cur_prices.get(code)
+        if cur is not None:
+            t.priced += 1
+            t.eval_amt += p.qty * cur
+            t.priced_cost += p.cost
+    return out
+
+
 # ── 빌드 ─────────────────────────────────────────────────────────────────────
 def build_manual_daily(
     date_ymd: str,
@@ -518,6 +579,56 @@ def _fetch_domestic_via_broker(
     return out
 
 
+def resolve_current_prices(
+    cfg: Config,
+    symbols: list[tuple[str, str]],
+    manual_prices: dict[str, float] | None = None,
+    *,
+    do_fetch: bool = True,
+    log: LogFn | None = None,
+) -> dict[str, float]:
+    """심볼 목록의 현재가를 해석한다 (해외=Yahoo, 국내=설정 API).
+
+    국내는 cfg.manual_domestic_api(yahoo/kiwoom/kis) 를 따르며, 증권사 조회
+    실패·누락분은 Yahoo 로 보완한다. 끝까지 못 구한 종목은 manual_prices 폴백.
+    do_fetch=False 거나 symbols 가 비면 manual_prices 만 반환.
+    """
+    log = log or (lambda _m: None)
+    manual_prices = manual_prices or {}
+    cur_prices: dict[str, float] = dict(manual_prices)
+    if not (do_fetch and symbols):
+        return cur_prices
+
+    domestic = [(c, m) for c, m in symbols if prices.currency_of(m) == "KRW"]
+    foreign = [(c, m) for c, m in symbols if prices.currency_of(m) != "KRW"]
+    domestic_api = (cfg.manual_domestic_api or "yahoo").lower()
+
+    if foreign:
+        log(f"해외 {len(foreign)}종목 Yahoo 현재가 조회...")
+        fp, _e = prices.resolve_prices(foreign, manual_prices, do_fetch=True, log=log)
+        cur_prices.update(fp)
+    if domestic:
+        label = {"yahoo": "Yahoo", "kiwoom": "키움", "kis": "한투"}.get(domestic_api, "Yahoo")
+        log(f"국내 {len(domestic)}종목 {label} 현재가 조회...")
+        if domestic_api in ("kiwoom", "kis"):
+            dcodes = [c for c, _m in domestic]
+            try:
+                dp = _fetch_domestic_via_broker(cfg, dcodes, domestic_api, log)
+            except Exception as e:  # noqa: BLE001  인증/네트워크 실패 → Yahoo 폴백
+                log(f"[warn] {label} 조회 실패({e}) → Yahoo 폴백")
+                dp, _e = prices.resolve_prices(domestic, manual_prices, do_fetch=True, log=log)
+            else:
+                missing = [(c, m) for c, m in domestic if c not in dp]
+                if missing:  # 일부 실패분은 Yahoo 로 보완
+                    yp, _e = prices.resolve_prices(missing, manual_prices, do_fetch=True, log=log)
+                    dp.update(yp)
+            cur_prices.update(dp)
+        else:
+            dp, _e = prices.resolve_prices(domestic, manual_prices, do_fetch=True, log=log)
+            cur_prices.update(dp)
+    return cur_prices
+
+
 # ── 오케스트레이션 ───────────────────────────────────────────────────────────
 def run_manual_journal(
     cfg: Config,
@@ -550,38 +661,12 @@ def run_manual_journal(
 
     log(f"[1/4] {ymd_dashed(ymd)} 기준 원장 재생...")
     symbols = held_symbols(use_entries, ymd)
-    domestic = [(c, m) for c, m in symbols if prices.currency_of(m) == "KRW"]
-    foreign = [(c, m) for c, m in symbols if prices.currency_of(m) != "KRW"]
 
     cur_prices: dict[str, float] = dict(ledger.prices)
     fx: dict[str, float] = {}
-    domestic_api = (cfg.manual_domestic_api or "yahoo").lower()
     if do_fetch and symbols:
-        # 해외주식: 항상 Yahoo
-        if foreign:
-            log(f"[2/4] 해외 {len(foreign)}종목 Yahoo 현재가 조회...")
-            fp, _e = prices.resolve_prices(foreign, ledger.prices, do_fetch=True, log=log)
-            cur_prices.update(fp)
-        # 국내주식: 설정된 API (yahoo/kiwoom/kis)
-        if domestic:
-            label = {"yahoo": "Yahoo", "kiwoom": "키움", "kis": "한투"}.get(domestic_api, "Yahoo")
-            log(f"[2/4] 국내 {len(domestic)}종목 {label} 현재가 조회...")
-            dcodes = [c for c, _m in domestic]
-            if domestic_api in ("kiwoom", "kis"):
-                try:
-                    dp = _fetch_domestic_via_broker(cfg, dcodes, domestic_api, log)
-                except Exception as e:  # noqa: BLE001  인증/네트워크 실패 → Yahoo 폴백
-                    log(f"[warn] {label} 조회 실패({e}) → Yahoo 폴백")
-                    dp, _e = prices.resolve_prices(domestic, ledger.prices, do_fetch=True, log=log)
-                else:
-                    missing = [(c, m) for c, m in domestic if c not in dp]
-                    if missing:  # 일부 실패분은 Yahoo 로 보완
-                        yp, _e = prices.resolve_prices(missing, ledger.prices, do_fetch=True, log=log)
-                        dp.update(yp)
-                cur_prices.update(dp)
-            else:
-                dp, _e = prices.resolve_prices(domestic, ledger.prices, do_fetch=True, log=log)
-                cur_prices.update(dp)
+        log("[2/4] 현재가 조회...")
+        cur_prices = resolve_current_prices(cfg, symbols, ledger.prices, do_fetch=True, log=log)
         currencies = sorted({prices.currency_of(m) for _c, m in symbols})
         fx = prices.resolve_fx(currencies, do_fetch=True, log=log)
     else:
@@ -595,9 +680,9 @@ def run_manual_journal(
     commentary = _maybe_ai(cfg, data, log)
 
     log(f"[4/4] 출력 생성 ({fmt})...")
-    out_base = cfg.journal_dir / f"{ymd}_{out_label}"
-    out_json = cfg.journal_dir / f"{ymd}_{out_label}.json"
-    cfg.journal_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _writable_out_dir(cfg.journal_dir, log)
+    out_base = out_dir / f"{ymd}_{out_label}"
+    out_json = out_dir / f"{ymd}_{out_label}.json"
     snapshot = {
         "ymd": ymd,
         "entries": [e.to_dict() for e in use_entries],
@@ -619,5 +704,6 @@ __all__ = [
     "load_ledger", "save_ledger", "load_book", "save_book",
     "export_book", "import_book",
     "parse_bulk_entries", "parse_excel_entries", "write_sample_xlsx", "BULK_HEADER",
-    "build_manual_daily", "held_symbols", "run_manual_journal", "today_ymd",
+    "build_manual_daily", "held_symbols", "resolve_current_prices",
+    "HoldingsTotal", "holdings_totals", "run_manual_journal", "today_ymd",
 ]

@@ -48,6 +48,8 @@ class Settings:
 
     # 화면 테마: 'light' | 'dark'
     theme: str = "light"
+    # 테마 엔진: 'auto'(sv-ttk, Win11 룩) | 'lite'(clam, 리사이즈 빠름)
+    theme_engine: str = "auto"
 
     # 키움
     kiwoom_app_key: str = ""
