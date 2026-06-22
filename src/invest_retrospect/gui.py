@@ -27,7 +27,10 @@ from tkinter import (
     simpledialog,
     ttk,
 )
+from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
+
+from tksheet import Sheet
 
 from invest_retrospect import ledger_db, market, prices
 from invest_retrospect.brokers import Broker
@@ -96,6 +99,39 @@ _PALETTES = {"light": _LIGHT, "dark": _DARK}
 
 # 현재 활성 팔레트 (라벨/트리 색상 함수가 참조). 테마 적용 시 갱신된다.
 _CUR = _LIGHT
+
+
+def _sheet_font() -> tuple[str, int, str]:
+    """tksheet 용 폰트 — Tk 기본 폰트 패밀리를 따라 한글이 정상 렌더되도록 한다."""
+    try:
+        df = tkfont.nametofont("TkDefaultFont")
+        fam = df.actual("family") or "TkDefaultFont"
+        size = abs(int(df.actual("size") or 11)) or 11
+    except Exception:  # noqa: BLE001  폰트 조회 실패 시 안전한 기본값
+        fam, size = "TkDefaultFont", 11
+    return (fam, max(size, 10), "normal")
+
+
+def _sheet_theme_kwargs() -> dict:
+    """현재 팔레트(_CUR)에 맞춘 tksheet 색상 옵션 (생성·테마변경 공용)."""
+    p = _CUR
+    return dict(
+        frame_bg=p.bg, outline_color=p.border,
+        table_bg=p.entry_bg, table_fg=p.fg, table_grid_fg=p.border,
+        header_bg=p.heading_bg, header_fg=p.fg,
+        header_grid_fg=p.border, header_border_fg=p.border,
+        index_bg=p.heading_bg, index_fg=p.fg, index_grid_fg=p.border,
+        top_left_bg=p.heading_bg,
+        table_selected_cells_bg=p.select_bg, table_selected_cells_fg=p.select_fg,
+        table_selected_rows_bg=p.select_bg, table_selected_rows_fg=p.select_fg,
+        table_selected_columns_bg=p.select_bg, table_selected_columns_fg=p.select_fg,
+        table_selected_box_cells_fg=p.select_bg,
+        table_selected_box_rows_fg=p.select_bg,
+        table_selected_box_columns_fg=p.select_bg,
+        table_selected_cells_border_fg=p.select_bg,
+        table_selected_rows_border_fg=p.select_bg,
+        table_selected_columns_border_fg=p.select_bg,
+    )
 
 
 def _dir_color(direction: str) -> str:
@@ -638,9 +674,9 @@ class JournalTab(ttk.Frame):
         ttk.Label(self, text="형식").grid(row=3, column=0, sticky="w", padx=PAD, pady=2)
         fmt_frame = ttk.Frame(self)
         fmt_frame.grid(row=3, column=1, sticky="w")
-        self.fmt_var = StringVar(value="md")
-        ttk.Radiobutton(fmt_frame, text="Markdown", variable=self.fmt_var, value="md").pack(side="left")
-        ttk.Radiobutton(fmt_frame, text="PDF", variable=self.fmt_var, value="pdf").pack(side="left", padx=(PAD, 0))
+        self.fmt_var = StringVar(value="pdf")
+        ttk.Radiobutton(fmt_frame, text="PDF", variable=self.fmt_var, value="pdf").pack(side="left")
+        ttk.Radiobutton(fmt_frame, text="Markdown", variable=self.fmt_var, value="md").pack(side="left", padx=(PAD, 0))
         ttk.Radiobutton(fmt_frame, text="둘 다", variable=self.fmt_var, value="both").pack(side="left", padx=(PAD, 0))
 
         action_frame = ttk.Frame(self)
@@ -738,6 +774,7 @@ class AccountLedgerFrame(ttk.Frame):
     _COL_W = {"check": 34, "date": 80, "market": 64, "name": 130, "code": 70,
               "side": 50, "qty": 64, "price": 90, "cur": 90, "tag": 70}
     _CHECK_ON, _CHECK_OFF = "☑", "☐"
+    _FETCH_INTERVAL_MS = 30_000   # '현재가 조회' 자동 반복 주기 (30초)
 
     def __init__(self, master: ttk.Notebook, app: "App",
                  manual_tab: "ManualLedgerTab", name: str, ledger: Ledger) -> None:
@@ -749,9 +786,14 @@ class AccountLedgerFrame(ttk.Frame):
         self._result: JournalResult | None = None
         self._checked: set[int] = set()    # 체크된 항목 (id(entry) 기준 — 객체 식별)
         self._cur_prices: dict[str, float] = {}   # 조회된 현재가 {코드: 가격} (목록 표시용)
+        self._auto_fetch = False           # 현재가 자동 조회(30초) 활성 여부
+        self._auto_after_id = None         # 다음 자동 조회 예약 id
+        self._fetching = False             # 조회 진행 중 — 주기 중복 실행 방지
         self._build()
         self._reload_tree()
         self._refresh_price_label()
+        # 프레임 파기 시 예약된 자동 조회를 취소 (탭 재생성/종료 대비)
+        self.bind("<Destroy>", self._on_destroy)
 
     def _persist(self) -> None:
         """원장 변경을 묶음 전체 파일에 저장 (컨테이너 경유)."""
@@ -805,26 +847,36 @@ class AccountLedgerFrame(ttk.Frame):
         list_frame.grid(row=2, column=0, sticky="nsew", pady=(PAD, 0))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(list_frame, columns=self._COLS, show="headings", height=8,
-                                 selectmode="extended")
-        for c in self._COLS:
-            self.tree.heading(c, text=self._HEADS[c])
-            anchor = "w" if c in ("name", "tag") else "center"
-            self.tree.column(c, width=self._COL_W[c], anchor=anchor,
-                             stretch=(c in ("name", "tag")))
-        self.tree.bind("<Button-1>", self._on_tree_click)
-        self.tree.bind("<Double-1>", self._on_tree_double)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=sb.set)
+        self._check_col = self._COLS.index("check")
+        self._cur_col = self._COLS.index("cur")
+        # tksheet 시트: 현재가 셀만 등락색을 칠하기 위해 셀 단위 색상 지원 위젯 사용.
+        # (ttk.Treeview 는 행 단위 색만 가능)
+        self.sheet = Sheet(
+            list_frame, headers=[self._HEADS[c] for c in self._COLS],
+            show_row_index=False, show_top_left=False, show_x_scrollbar=False,
+            height=200, font=_sheet_font(), header_font=_sheet_font(),
+            **_sheet_theme_kwargs(),
+        )
+        # 셀(=행) 선택만 허용 · 셀 편집은 비활성(수정은 더블클릭 대화상자에서).
+        self.sheet.enable_bindings(
+            "single_select", "toggle_select", "drag_select",
+            "column_width_resize", "arrowkeys")
+        for idx, c in enumerate(self._COLS):
+            self.sheet.column_width(idx, self._COL_W[c])
+        self.sheet.align_columns(
+            {idx: ("w" if c in ("name", "tag") else "c")
+             for idx, c in enumerate(self._COLS)})
+        # 체크(✓) 열 클릭 토글 · 더블클릭으로 항목 수정
+        self.sheet.MT.bind("<ButtonRelease-1>", self._on_sheet_click, add="+")
+        self.sheet.MT.bind("<Double-Button-1>", self._on_sheet_double, add="+")
+        self.sheet.grid(row=0, column=0, columnspan=2, sticky="nsew")
         bar = ttk.Frame(list_frame)
         bar.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))
         ttk.Button(bar, text="전체 체크", command=lambda: self._check_all(True)).pack(side="left")
         ttk.Button(bar, text="전체 해제", command=lambda: self._check_all(False)).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="선택 항목 수정", command=self._edit_selected).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="선택 항목 삭제", command=self._delete_selected).pack(side="left", padx=(PAD, 0))
-        self.fetch_px_btn = ttk.Button(bar, text="현재가 조회", command=self._fetch_prices)
+        self.fetch_px_btn = ttk.Button(bar, text="현재가 조회", command=self._toggle_auto_fetch)
         self.fetch_px_btn.pack(side="left", padx=(PAD, 0))
         # 업로드/샘플은 오른쪽 끝에 고정 — 버튼이 많아도 화면 밖으로 잘리지 않도록.
         ttk.Button(bar, text="샘플 다운로드", command=self._download_sample).pack(side="right")
@@ -851,7 +903,7 @@ class AccountLedgerFrame(ttk.Frame):
         gen = ttk.LabelFrame(self, text="매매일지 생성", padding=PAD)
         gen.grid(row=4, column=0, sticky="we", pady=(PAD, 0))
         self.gen_date = StringVar(value=today_ymd())
-        self.gen_fmt = StringVar(value="md")
+        self.gen_fmt = StringVar(value="pdf")
         self.gen_fetch = BooleanVar(value=True)
 
         # 국내 시세 조회 API (해외는 항상 Yahoo) — 즉시 자동 저장되는 공용 설정에 바인딩
@@ -867,8 +919,8 @@ class AccountLedgerFrame(ttk.Frame):
 
         ttk.Label(gen, text="기준일 (YYYYMMDD)").grid(row=1, column=0, padx=2, sticky="w")
         ttk.Entry(gen, textvariable=self.gen_date, width=10).grid(row=1, column=1, padx=2)
-        ttk.Radiobutton(gen, text="MD", variable=self.gen_fmt, value="md").grid(row=1, column=2, padx=2)
-        ttk.Radiobutton(gen, text="PDF", variable=self.gen_fmt, value="pdf").grid(row=1, column=3, padx=2)
+        ttk.Radiobutton(gen, text="PDF", variable=self.gen_fmt, value="pdf").grid(row=1, column=2, padx=2)
+        ttk.Radiobutton(gen, text="MD", variable=self.gen_fmt, value="md").grid(row=1, column=3, padx=2)
         ttk.Radiobutton(gen, text="둘 다", variable=self.gen_fmt, value="both").grid(row=1, column=4, padx=2)
         ttk.Checkbutton(gen, text="자동 시세조회", variable=self.gen_fetch).grid(
             row=1, column=5, padx=(PAD, 2)
@@ -893,16 +945,32 @@ class AccountLedgerFrame(ttk.Frame):
     def _reload_tree(self) -> None:
         # 사라진 항목의 체크 상태 정리
         self._checked &= {id(e) for e in self.ledger.entries}
-        self.tree.delete(*self.tree.get_children())
+        rows, ups, downs = [], [], []
         for i, e in enumerate(self.ledger.entries):
             mark = self._CHECK_ON if id(e) in self._checked else self._CHECK_OFF
             cur = self._cur_prices.get(e.stk_cd)
-            cur_txt = _fmt_price(cur) if cur is not None else ""
-            self.tree.insert(
-                "", "end", iid=str(i),
-                values=(mark, e.date, e.market, e.stk_nm, e.stk_cd, e.side,
-                        f"{e.qty:,}", _fmt_price(e.price), cur_txt, e.tag),
-            )
+            # 현재가가 단가보다 위/아래인지 +/− 부호로 표시하고, 현재가 셀만 등락색.
+            cur_txt = ""
+            if cur is not None:
+                if cur > e.price:
+                    cur_txt = f"+{_fmt_price(cur)}"; ups.append(i)
+                elif cur < e.price:
+                    cur_txt = f"−{_fmt_price(cur)}"; downs.append(i)
+                else:
+                    cur_txt = _fmt_price(cur)
+            rows.append([mark, e.date, e.market, e.stk_nm, e.stk_cd, e.side,
+                         f"{e.qty:,}", _fmt_price(e.price), cur_txt, e.tag])
+        # 컬럼 너비는 유지(reset_col_positions=False)하고 기존 하이라이트는 초기화.
+        self.sheet.set_sheet_data(rows, reset_col_positions=False,
+                                  reset_highlights=True, redraw=False)
+        c = self._cur_col
+        if ups:
+            self.sheet.highlight_cells(cells=[(r, c) for r in ups],
+                                       fg=_CUR.up, redraw=False)
+        if downs:
+            self.sheet.highlight_cells(cells=[(r, c) for r in downs],
+                                       fg=_CUR.down, redraw=False)
+        self.sheet.refresh()
         self._render_summary()
 
     def _render_summary(self) -> None:
@@ -935,24 +1003,20 @@ class AccountLedgerFrame(ttk.Frame):
                           style="Hint.TLabel").grid(row=row, column=2, sticky="w")
             row += 1
 
-    def _on_tree_click(self, event) -> None:
+    def _on_sheet_click(self, event) -> None:
         """체크(✓) 열 클릭 시 해당 항목 체크 토글."""
-        if self.tree.identify_region(event.x, event.y) != "cell":
+        if self.sheet.identify_column(event, allow_end=False) != self._check_col:
             return
-        if self.tree.identify_column(event.x) != "#1":   # 첫 열 = check
+        row = self.sheet.identify_row(event, allow_end=False)
+        if row is None or not (0 <= row < len(self.ledger.entries)):
             return
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        entry = self.ledger.entries[int(iid)]
-        eid = id(entry)
+        eid = id(self.ledger.entries[row])
         if eid in self._checked:
             self._checked.discard(eid)
         else:
             self._checked.add(eid)
-        self.tree.set(iid, "check",
-                      self._CHECK_ON if eid in self._checked else self._CHECK_OFF)
-        return "break"
+        mark = self._CHECK_ON if eid in self._checked else self._CHECK_OFF
+        self.sheet.set_cell_data(row, self._check_col, mark, redraw=True)
 
     def _check_all(self, on: bool) -> None:
         self._checked = {id(e) for e in self.ledger.entries} if on else set()
@@ -1003,19 +1067,23 @@ class AccountLedgerFrame(ttk.Frame):
         self._reload_tree()
         self.in_name.set(""); self.in_code.set(""); self.in_qty.set(""); self.in_price.set("")
 
+    def _selected_rows(self) -> set:
+        """선택된 셀이 걸쳐 있는 행 인덱스 집합 (셀 단위 선택 기반)."""
+        return {r for r, _c in self.sheet.get_selected_cells()}
+
     def _edit_selected(self) -> None:
-        sel = self.tree.selection()
+        sel = self._selected_rows()
         if len(sel) != 1:
             messagebox.showinfo("수정", "수정할 항목 한 개를 선택하세요.")
             return
-        self._edit_entry(int(sel[0]))
+        self._edit_entry(next(iter(sel)))
 
-    def _on_tree_double(self, event) -> None:
-        if self.tree.identify_column(event.x) == "#1":   # 체크 열은 토글 전용
-            return
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            self._edit_entry(int(iid))
+    def _on_sheet_double(self, event) -> None:
+        if self.sheet.identify_column(event, allow_end=False) == self._check_col:
+            return   # 체크 열은 토글 전용
+        row = self.sheet.identify_row(event, allow_end=False)
+        if row is not None and 0 <= row < len(self.ledger.entries):
+            self._edit_entry(row)
 
     def _edit_entry(self, idx: int) -> None:
         if not (0 <= idx < len(self.ledger.entries)):
@@ -1158,21 +1226,70 @@ class AccountLedgerFrame(ttk.Frame):
         if messagebox.askyesno("샘플 저장 완료", f"{out}\n\n파일을 여시겠습니까?"):
             _open_path(out)
 
-    # ── 현재가 조회 ────────────────────────────────────────────────────────
-    def _fetch_prices(self) -> None:
-        """원장의 모든 종목 현재가를 조회해 '현재가' 열에 표시 (해외=Yahoo, 국내=설정 API)."""
-        self.app.flush_save()
+    # ── 현재가 조회 (30초 자동 반복) ─────────────────────────────────────────
+    def _toggle_auto_fetch(self) -> None:
+        """'현재가 조회' 버튼: 누르면 30초마다 자동 조회 시작, 다시 누르면 중지."""
+        if self._auto_fetch:
+            self._stop_auto_fetch()
+        else:
+            self._start_auto_fetch()
+
+    def _start_auto_fetch(self) -> None:
         if not self.ledger.entries:
             messagebox.showinfo("원장 비어 있음", "먼저 원장 항목을 추가하세요.")
+            return
+        self._auto_fetch = True
+        self.fetch_px_btn.configure(text="자동조회 중지 (30초)")
+        self._log(f"[현재가] 자동 조회 시작 — {self._FETCH_INTERVAL_MS // 1000}초 주기.")
+        self._fetch_prices()
+
+    def _stop_auto_fetch(self) -> None:
+        if not self._auto_fetch and self._auto_after_id is None:
+            return   # 이미 멈춘 상태 — 불필요한 로그/재설정 방지
+        self._auto_fetch = False
+        if self._auto_after_id is not None:
+            self.after_cancel(self._auto_after_id)
+            self._auto_after_id = None
+        self.fetch_px_btn.configure(text="현재가 조회", state="normal")
+        self._log("[현재가] 자동 조회 중지.")
+
+    def _schedule_auto_fetch(self) -> None:
+        """자동 모드면 다음 조회를 예약 (조회 완료 후 호출 — 중첩 방지)."""
+        if self._auto_fetch:
+            self._auto_after_id = self.after(self._FETCH_INTERVAL_MS, self._fetch_prices)
+
+    def _on_destroy(self, event) -> None:
+        # 이 프레임 자체가 파기될 때만 예약된 자동 조회를 취소.
+        if event.widget is self and self._auto_after_id is not None:
+            try:
+                self.after_cancel(self._auto_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._auto_after_id = None
+
+    def _fetch_prices(self) -> None:
+        """원장의 모든 종목 현재가를 조회해 '현재가' 열에 표시 (해외=Yahoo, 국내=설정 API)."""
+        if self._fetching:   # 이전 조회가 아직 진행 중이면 이번 주기는 건너뜀
+            return
+        self.app.flush_save()
+        if not self.ledger.entries:
+            if self._auto_fetch:
+                self._stop_auto_fetch()
+            else:
+                messagebox.showinfo("원장 비어 있음", "먼저 원장 항목을 추가하세요.")
             return
         try:  # broker 를 manual 로 강제 → 활성 증권사 키 검증 우회, 국내 API 검증만 적용
             cfg = config_from_settings(replace(self.app.settings, broker="manual"))
         except RuntimeError as e:
+            if self._auto_fetch:
+                self._stop_auto_fetch()
             messagebox.showerror("설정 오류", str(e))
             return
         # 원장에 등장하는 모든 (코드, 시장) — resolve_current_prices 가 중복 제거.
         symbols = [(e.stk_cd, e.market) for e in self.ledger.entries if e.stk_cd]
-        self.fetch_px_btn.configure(state="disabled")
+        self._fetching = True
+        if not self._auto_fetch:   # 자동 모드에선 버튼이 '중지' 토글로 활성 유지
+            self.fetch_px_btn.configure(state="disabled")
         self._log("[현재가] 조회 시작...")
         threading.Thread(
             target=self._fetch_prices_worker, args=(cfg, symbols), daemon=True
@@ -1189,9 +1306,16 @@ class AccountLedgerFrame(ttk.Frame):
         self.after(0, self._on_fetch_prices_done, prices_map, None)
 
     def _on_fetch_prices_done(self, prices_map, exc) -> None:
-        self.fetch_px_btn.configure(state="normal")
+        self._fetching = False
+        if not self._auto_fetch:
+            self.fetch_px_btn.configure(state="normal")
         if exc is not None:
-            messagebox.showerror("현재가 조회 실패", str(exc))
+            # 자동 모드에선 일시적 오류로 멈추지 않고 다음 주기에 재시도(로그만 남김).
+            if self._auto_fetch:
+                self._log(f"[현재가] 자동 조회 실패 — 다음 주기 재시도: {exc}")
+                self._schedule_auto_fetch()
+            else:
+                messagebox.showerror("현재가 조회 실패", str(exc))
             return
         self._cur_prices = prices_map or {}
         self._reload_tree()
@@ -1201,26 +1325,33 @@ class AccountLedgerFrame(ttk.Frame):
         miss = len(codes) - got
         if codes and got == 0:
             self._log("[현재가] 한 건도 가져오지 못했습니다 — 로그의 [warn] 원인을 확인하세요.")
-            messagebox.showwarning(
-                "현재가 조회 실패",
-                "시세를 한 건도 가져오지 못했습니다.\n\n"
-                "· 사내망/프록시가 Yahoo Finance 접속을 차단하거나\n"
-                "· 증권사(키움/한투) 인증이 실패했을 수 있습니다.\n\n"
-                "[매매일지 생성]의 '국내 시세 API'를 '야후'로 바꾸거나, "
-                "'수동 현재가'에 직접 입력해 보세요. 자세한 원인은 로그 창을 확인하세요.")
+            if not self._auto_fetch:   # 자동 모드에선 매 주기 팝업이 뜨지 않도록 로그만
+                messagebox.showwarning(
+                    "현재가 조회 실패",
+                    "시세를 한 건도 가져오지 못했습니다.\n\n"
+                    "· 사내망/프록시가 Yahoo Finance 접속을 차단하거나\n"
+                    "· 증권사(키움/한투) 인증이 실패했을 수 있습니다.\n\n"
+                    "[매매일지 생성]의 '국내 시세 API'를 '야후'로 바꾸거나, "
+                    "'수동 현재가'에 직접 입력해 보세요. 자세한 원인은 로그 창을 확인하세요.")
         else:
             msg = f"[현재가] {got}/{len(codes)}종목 조회 완료."
             if miss:
                 msg += f" ({miss}종목 실패 → 빈칸/수동값)"
             self._log(msg)
+        self._schedule_auto_fetch()
 
     def _delete_selected(self) -> None:
-        sel = set(self.tree.selection())
+        sel = self._selected_rows()
         if not sel:
             return
-        keep = [e for i, e in enumerate(self.ledger.entries) if str(i) not in sel]
+        keep = [e for i, e in enumerate(self.ledger.entries) if i not in sel]
         self.ledger.entries = keep
         self._persist()
+        self._reload_tree()
+
+    def apply_theme(self) -> None:
+        """테마 변경 시 시트 색상과 현재가 등락색을 최신 팔레트로 갱신."""
+        self.sheet.set_options(**_sheet_theme_kwargs(), redraw=False)
         self._reload_tree()
 
     def _set_price(self) -> None:
@@ -1434,12 +1565,12 @@ class ManualLedgerTab(ttk.Frame):
         gen = ttk.LabelFrame(self, text="전 계좌 매매일지 생성", padding=PAD)
         gen.grid(row=2, column=0, sticky="we", pady=(PAD, 0))
         self.gen_date = StringVar(value=today_ymd())
-        self.gen_fmt = StringVar(value="md")
+        self.gen_fmt = StringVar(value="pdf")
         self.gen_fetch = BooleanVar(value=True)
         ttk.Label(gen, text="기준일(YYYYMMDD)").grid(row=0, column=0, padx=2, sticky="w")
         ttk.Entry(gen, textvariable=self.gen_date, width=10).grid(row=0, column=1, padx=2)
-        ttk.Radiobutton(gen, text="MD", variable=self.gen_fmt, value="md").grid(row=0, column=2, padx=2)
-        ttk.Radiobutton(gen, text="PDF", variable=self.gen_fmt, value="pdf").grid(row=0, column=3, padx=2)
+        ttk.Radiobutton(gen, text="PDF", variable=self.gen_fmt, value="pdf").grid(row=0, column=2, padx=2)
+        ttk.Radiobutton(gen, text="MD", variable=self.gen_fmt, value="md").grid(row=0, column=3, padx=2)
         ttk.Radiobutton(gen, text="둘 다", variable=self.gen_fmt, value="both").grid(row=0, column=4, padx=2)
         ttk.Checkbutton(gen, text="자동 시세조회", variable=self.gen_fetch).grid(row=0, column=5, padx=(PAD, 2))
         self.batch_indiv_btn = ttk.Button(
@@ -1461,6 +1592,8 @@ class ManualLedgerTab(ttk.Frame):
     # ── 탭 관리 ────────────────────────────────────────────────────────────
     def _rebuild_tabs(self) -> None:
         self._building = True
+        for fr in self.frames.values():   # 예약된 자동 조회 정리 후 탭 재생성
+            fr._stop_auto_fetch()
         for tab in list(self.nb.tabs()):
             self.nb.forget(tab)
         self.frames.clear()
@@ -1976,6 +2109,9 @@ class App(Tk):
         self._recolor_classic(self)
         if hasattr(self, "market_tab"):
             self.market_tab.apply_theme()
+        if hasattr(self, "manual_tab"):
+            for fr in self.manual_tab.frames.values():
+                fr.apply_theme()
 
     def _apply_clam_theme(self, pal: "_Palette") -> None:
         """sv-ttk 를 못 쓸 때의 폴백 — clam 테마를 팔레트 색으로 직접 칠한다."""
@@ -2035,6 +2171,9 @@ class App(Tk):
 
     def _recolor_classic(self, w) -> None:
         """ttk 가 아닌 클래식 Tk 위젯(Canvas/Text/Toplevel)을 팔레트 색으로 칠한다."""
+        # tksheet 시트는 자체 색상 옵션으로 칠하므로 내부 캔버스는 건드리지 않는다.
+        if isinstance(w, Sheet):
+            return
         cls = w.winfo_class()
         try:
             if cls == "Canvas":

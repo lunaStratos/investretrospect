@@ -26,6 +26,7 @@ for pkg in (
     "reportlab",
     "openpyxl",
     "bs4",
+    "tksheet",         # 수동 원장 표(현재가 셀 등락색)
 ):
     try:
         d, b, h = collect_all(pkg)

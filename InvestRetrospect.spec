@@ -27,6 +27,7 @@ for pkg in (
     "reportlab",         # PDF 생성: CMap (CID 폰트) 데이터 파일 포함
     "openpyxl",          # 수동 원장 엑셀 업로드/샘플
     "bs4",               # 시장 대시보드 HTML 파싱
+    "tksheet",           # 수동 원장 표(현재가 셀 등락색)
 ):
     try:
         d, b, h = collect_all(pkg)
