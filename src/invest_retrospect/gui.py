@@ -1513,6 +1513,31 @@ class ManualLedgerTab(ttk.Frame):
         self._source_key = self._current_source_key()
         self.book = self._load_source_book()
         self._rebuild_tabs()
+        self._refresh_mode_label()
+        self._fetch_active_prices_once()
+
+    def _fetch_active_prices_once(self) -> None:
+        """원장 로드 직후(모드 전환·다시 불러오기) 활성 계좌의 현재가를 1회 자동 조회.
+
+        항목이 있는 계좌에 한해 1회만 조회한다(자동 30초 반복은 아님 — 그건 버튼 토글).
+        """
+        fr = self.frames.get(self.book.active)
+        if fr is not None and fr.ledger.entries and not fr._fetching:
+            fr._fetch_prices()
+
+    def _refresh_mode_label(self) -> None:
+        """현재 저장 모드(오프라인/온라인 DB)와 DB 접속 상태를 툴바에 표시."""
+        if not hasattr(self, "mode_label"):
+            return
+        if self._db_settings() is None:
+            self.mode_label.configure(text="💾 모드: 오프라인 (로컬 파일)",
+                                      style="Hint.TLabel")
+        elif self._db_ok:
+            self.mode_label.configure(text="🌐 모드: 온라인 (DB)",
+                                      style="Hint.TLabel")
+        else:
+            self.mode_label.configure(text="🌐 모드: 온라인 (DB) · 접속 실패",
+                                      style="Gain.TLabel")
 
     # ── 영속화 ─────────────────────────────────────────────────────────────
     def _save_book(self) -> None:
@@ -1555,6 +1580,11 @@ class ManualLedgerTab(ttk.Frame):
         ttk.Button(bar, text="전체 백업...", command=self._backup_book).pack(side="left", padx=(PAD * 2, 0))
         ttk.Button(bar, text="전체 복구...", command=self._restore_book).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="🔄 다시 불러오기", command=self._reload_now).pack(side="left", padx=(PAD, 0))
+
+        # 현재 저장 모드 표시 (오프라인 / 온라인(DB)) — 오른쪽 끝 고정
+        self.mode_label = ttk.Label(bar, style="Hint.TLabel")
+        self.mode_label.pack(side="right")
+        self._refresh_mode_label()
 
         # 계좌 탭 (＋ 탭 포함)
         self.nb = ttk.Notebook(self)
