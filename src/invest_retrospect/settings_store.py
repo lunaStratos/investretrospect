@@ -17,6 +17,9 @@ SETTINGS_DIR = Path.home() / ".invest-retrospect"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 # 수동 원장(매수/매도 변화 + 수동 현재가) 저장 경로
 MANUAL_LEDGER_PATH = SETTINGS_DIR / "manual_ledger.json"
+# DB 모드 보조 상태(활성 계좌·계좌 순서·수동 현재가) 로컬 저장 경로.
+# 매매 항목 자체는 외부 DB 테이블에 두되, UI 메타데이터는 로컬에 둔다.
+MANUAL_LEDGER_DBAUX_PATH = SETTINGS_DIR / "manual_ledger_dbaux.json"
 
 # 구버전(KiwoomToday) 설정 경로. 최초 실행 시 새 경로로 1회 자동 마이그레이션한다.
 _LEGACY_SETTINGS_DIR = Path.home() / ".kiwoom-today"
@@ -88,6 +91,17 @@ class Settings:
 
     # 수동 원장 국내 시세 조회 API: 'yahoo' | 'kiwoom' | 'kis' (해외는 항상 yahoo)
     manual_domestic_api: str = "yahoo"
+
+    # 수동 원장 저장 모드: 'offline'(로컬 JSON 파일) | 'db'(외부 DB 테이블)
+    manual_ledger_mode: str = "offline"
+    # DB 모드 접속 정보 (manual_ledger_mode == 'db' 일 때만 사용)
+    manual_db_kind: str = "mysql"        # 'mysql'(MariaDB 포함) | 'postgresql'
+    manual_db_host: str = ""             # 'host' 또는 'host:port'
+    manual_db_name: str = ""             # 데이터베이스(스키마) 이름
+    manual_db_user: str = ""
+    manual_db_password: str = ""
+    manual_db_table: str = "manual_ledger"
+    manual_db_ssl: str = "1"             # '1'=SSL 사용(require) · ''=사용 안 함
 
     # 출력
     journal_dir: str = ""                # 빈 값이면 default_journal_dir() 사용

@@ -13,6 +13,12 @@ dependencies = [
     "beautifulsoup4>=4.12",   # 시장 대시보드: 네이버 금융 HTML(EUC-KR) 파싱
     "sv-ttk>=2.6",            # GUI 테마: Sun Valley(Windows 11 Fluent) 다크/라이트
 
+    # 수동 원장 DB 모드 (외부 DB 테이블 저장). 오프라인 모드만 쓰면 불필요하나,
+    # 단일 배포본으로 두 모드를 모두 지원하기 위해 기본 포함한다.
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",           # MariaDB/MySQL 드라이버
+    "psycopg[binary]>=3.1",   # PostgreSQL 드라이버
+
     # 대신증권 CYBOS Plus 연동용 — Windows + 32-bit Python 환경에서만 필요/설치됨.
     "pywin32>=306; sys_platform == 'win32'",
 ]

@@ -16,6 +16,7 @@ from pathlib import Path
 from tkinter import (
     BooleanVar,
     Canvas,
+    Menu,
     PhotoImage,
     StringVar,
     TclError,
@@ -28,7 +29,7 @@ from tkinter import (
 )
 from tkinter.scrolledtext import ScrolledText
 
-from invest_retrospect import market, prices
+from invest_retrospect import ledger_db, market, prices
 from invest_retrospect.brokers import Broker
 from invest_retrospect.core import JournalResult, run_journal, today_ymd
 from invest_retrospect.manual import (
@@ -210,6 +211,7 @@ class SettingsTab(ttk.Frame):
         self._build()
         self._update_ai_state()
         self._update_broker_state()
+        self._update_ledger_mode_state()
 
     def _build_scroll(self) -> None:
         """설정 내용이 길어 화면을 넘어가므로 세로 스크롤 캔버스에 담는다."""
@@ -352,6 +354,52 @@ class SettingsTab(ttk.Frame):
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         row += 1
 
+        # ── 수동 원장: 저장 모드 (오프라인 파일 / 외부 DB) ──────────────────
+        sbox = ttk.LabelFrame(self.body, text="수동 원장 — 저장 모드", padding=PAD)
+        sbox.grid(row=row, column=0, sticky="we", pady=(0, PAD))
+        sbox.columnconfigure(0, weight=1)
+        mode_var = self.app.setting_vars["manual_ledger_mode"]
+        mode_var.trace_add("write", lambda *_: self._update_ledger_mode_state())
+        mf = ttk.Frame(sbox)
+        mf.grid(row=0, column=0, sticky="w", padx=PAD, pady=2)
+        ttk.Radiobutton(mf, text="오프라인 (로컬 파일)", variable=mode_var, value="offline").pack(side="left")
+        ttk.Radiobutton(mf, text="DB (외부 데이터베이스)", variable=mode_var, value="db").pack(
+            side="left", padx=(PAD, 0))
+
+        # DB 접속 상세 (DB 모드일 때만 활성)
+        dbf = ttk.Frame(sbox)
+        dbf.grid(row=1, column=0, sticky="we", pady=(PAD, 0))
+        dbf.columnconfigure(1, weight=1)
+        ttk.Label(dbf, text="DB 종류").grid(row=0, column=0, sticky="w", padx=PAD, pady=2)
+        kindf = ttk.Frame(dbf)
+        kindf.grid(row=0, column=1, sticky="w")
+        kind_var = self.app.setting_vars["manual_db_kind"]
+        self._db_kind_radios: list[ttk.Radiobutton] = []
+        for txt, val in (("MariaDB/MySQL", "mysql"), ("PostgreSQL", "postgresql")):
+            rb = ttk.Radiobutton(kindf, text=txt, variable=kind_var, value=val)
+            rb.pack(side="left", padx=(0, PAD))
+            self._db_kind_radios.append(rb)
+        self._row(dbf, 1, "호스트 (host 또는 host:port)", "manual_db_host")
+        self._row(dbf, 2, "DB 이름", "manual_db_name")
+        self._row(dbf, 3, "사용자", "manual_db_user")
+        self._row(dbf, 4, "비밀번호", "manual_db_password", show="•")
+        self._row(dbf, 5, "테이블", "manual_db_table")
+        self._db_ssl_chk = ttk.Checkbutton(
+            dbf, text="SSL 사용 (require) — Neon 등 매니지드 DB 필수",
+            variable=self.app.setting_vars["manual_db_ssl"], onvalue="1", offvalue="")
+        self._db_ssl_chk.grid(row=6, column=1, sticky="w", padx=PAD, pady=2)
+        self._db_test_btn = ttk.Button(dbf, text="연결 테스트", command=self._test_db)
+        self._db_test_btn.grid(row=7, column=1, sticky="w", padx=PAD, pady=(4, 0))
+        ttk.Label(
+            sbox,
+            text="DB 모드: 매매 항목을 외부 DB 테이블 한 곳에 저장 — 여러 PC 공유 가능 "
+                 "(활성 계좌·수동 현재가는 로컬 보관). 테이블이 없으면 자동 생성됩니다.",
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, sticky="w", padx=PAD, pady=(2, 0))
+        self._db_keys = ("manual_db_host", "manual_db_name", "manual_db_user",
+                         "manual_db_password", "manual_db_table")
+        row += 1
+
         # ── AI 박스 ───────────────────────────────────────────────────────
         abox = ttk.LabelFrame(self.body, text="AI 코멘트", padding=PAD)
         abox.grid(row=row, column=0, sticky="we", pady=(0, PAD))
@@ -424,6 +472,53 @@ class SettingsTab(ttk.Frame):
 
         apply(self.GEMINI_KEYS, gemini_on)
         apply(self.OLLAMA_KEYS, ollama_on)
+
+    def _update_ledger_mode_state(self) -> None:
+        """DB 모드일 때만 DB 접속 입력을 활성화한다."""
+        on = self.app.setting_vars["manual_ledger_mode"].get() == "db"
+        state = "normal" if on else "disabled"
+        for k in self._db_keys:
+            if k in self._entries:
+                self._entries[k].configure(state=state)
+            if k in self._labels:
+                self._labels[k].configure(foreground="" if on else "#999")
+            if k in self._reveal_checks:
+                self._reveal_checks[k].configure(state=state)
+        for rb in self._db_kind_radios:
+            rb.configure(state=state)
+        self._db_ssl_chk.configure(state=state)
+        self._db_test_btn.configure(state=state)
+
+    def _test_db(self) -> None:
+        """현재 입력된 DB 접속을 백그라운드로 시험한다 (GUI 멈춤 방지).
+
+        워커 스레드는 결과만 속성에 담고, Tk 위젯 갱신·메시지박스는 메인 스레드
+        폴링(_poll_db_test)에서 처리한다 — Tk 는 메인 스레드에서만 호출해야 안전.
+        """
+        self.app.flush_save()
+        db = ledger_db.DbSettings.from_settings(self.app.settings)
+        self._db_test_btn.configure(state="disabled", text="테스트 중...")
+        self._db_test_result: tuple[str | None, str | None] | None = None
+
+        def work() -> None:
+            try:
+                self._db_test_result = (ledger_db.test_connection(db), None)
+            except Exception as e:  # noqa: BLE001  접속/드라이버/SQL 오류 전반
+                self._db_test_result = (None, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_db_test)
+
+    def _poll_db_test(self) -> None:
+        if self._db_test_result is None:        # 아직 진행 중 → 다시 폴링
+            self.after(100, self._poll_db_test)
+            return
+        msg, err = self._db_test_result
+        self._db_test_btn.configure(state="normal", text="연결 테스트")
+        if err:
+            messagebox.showerror("연결 실패", err)
+        else:
+            messagebox.showinfo("연결 성공", msg or "OK")
 
     def _update_broker_state(self) -> None:
         """선택되지 않은 broker 박스의 입력은 비활성화 + 회색."""
@@ -1237,19 +1332,77 @@ class ManualLedgerTab(ttk.Frame):
     def __init__(self, master: ttk.Notebook, app: "App") -> None:
         super().__init__(master, padding=PAD)
         self.app = app
-        self.book: LedgerBook = load_book()
         self.frames: dict[str, AccountLedgerFrame] = {}
         self._building = False
         self._last_dir: Path | None = None
+        self._db_ok = True                       # DB 모드에서 마지막 로드 성공 여부
+        self._source_key = self._current_source_key()
+        self.book: LedgerBook = self._load_source_book()
         self._build()
+        self._rebuild_tabs()
+
+    # ── 저장소 모드 ─────────────────────────────────────────────────────────
+    def _db_settings(self) -> "ledger_db.DbSettings | None":
+        """DB 모드면 접속정보, 오프라인이면 None."""
+        if (self.app.settings.manual_ledger_mode or "offline") != "db":
+            return None
+        return ledger_db.DbSettings.from_settings(self.app.settings)
+
+    def _current_source_key(self) -> tuple:
+        db = self._db_settings()
+        return ("db", *db.key()) if db else ("offline",)
+
+    def _load_source_book(self) -> LedgerBook:
+        db = self._db_settings()
+        if db is None:
+            self._db_ok = True
+            return load_book()
+        try:
+            book = ledger_db.load_book(db)
+        except Exception as e:  # noqa: BLE001  접속/드라이버/SQL 오류 전반
+            self._db_ok = False
+            messagebox.showerror(
+                "DB 불러오기 실패",
+                f"DB 에서 원장을 불러오지 못했습니다.\n{e}\n\n"
+                "[설정] 탭에서 접속 정보를 확인한 뒤 '다시 불러오기' 하세요.")
+            return LedgerBook()
+        self._db_ok = True
+        return book
+
+    def reload_if_source_changed(self) -> None:
+        """수동 원장 탭이 보일 때 호출 — 저장 모드/DB 설정이 바뀌었으면 다시 로드."""
+        self.app.flush_save()                    # 디바운스 중인 설정 즉시 반영
+        key = self._current_source_key()
+        if key == self._source_key and self._db_ok:
+            return
+        self._reload_now()
+
+    def _reload_now(self) -> None:
+        self.app.flush_save()
+        self._source_key = self._current_source_key()
+        self.book = self._load_source_book()
         self._rebuild_tabs()
 
     # ── 영속화 ─────────────────────────────────────────────────────────────
     def _save_book(self) -> None:
+        db = self._db_settings()
+        if db is None:
+            try:
+                save_book(self.book)
+            except OSError as e:
+                messagebox.showerror("저장 실패", str(e))
+            return
+        if not self._db_ok:
+            # 로드 실패 상태에서 저장하면 원격 데이터를 빈 값으로 덮어쓸 수 있어 막는다.
+            messagebox.showwarning(
+                "DB 저장 보류",
+                "DB 에서 원장을 정상적으로 불러오지 못해 저장을 보류합니다.\n"
+                "[설정] 탭에서 접속을 확인한 뒤 '다시 불러오기' 하세요.")
+            return
         try:
-            save_book(self.book)
-        except OSError as e:
-            messagebox.showerror("저장 실패", str(e))
+            ledger_db.save_book(self.book, db)
+        except Exception as e:  # noqa: BLE001  접속/드라이버/SQL 오류 전반
+            messagebox.showerror("DB 저장 실패", str(e))
 
     def out_label_for(self, name: str) -> str:
         """계좌명 → 출력 파일명 접미사(파일명 안전 문자만)."""
@@ -1270,6 +1423,7 @@ class ManualLedgerTab(ttk.Frame):
         ttk.Button(bar, text="계좌 삭제", command=self._delete_account).pack(side="left", padx=(PAD, 0))
         ttk.Button(bar, text="전체 백업...", command=self._backup_book).pack(side="left", padx=(PAD * 2, 0))
         ttk.Button(bar, text="전체 복구...", command=self._restore_book).pack(side="left", padx=(PAD, 0))
+        ttk.Button(bar, text="🔄 다시 불러오기", command=self._reload_now).pack(side="left", padx=(PAD, 0))
 
         # 계좌 탭 (＋ 탭 포함)
         self.nb = ttk.Notebook(self)
@@ -1912,6 +2066,8 @@ class App(Tk):
         except Exception:  # noqa: BLE001
             return
         self.market_tab.set_active(current is self.market_tab)
+        if current is self.manual_tab:
+            self.manual_tab.reload_if_source_changed()
 
     def _active_broker_ready(self) -> bool:
         b = self.settings.broker or "kiwoom"
@@ -1974,33 +2130,127 @@ class App(Tk):
             pass
 
     def _enable_clipboard_shortcuts(self) -> None:
-        """macOS 에서 Entry/Text 의 Cmd+C/V/X/A 가 안 먹는 문제 보정.
+        """한글 IME 상태에서도 복사/붙여넣기가 동작하도록 보정 + 우클릭 메뉴.
 
-        Command(맥)·Control(타OS) 양쪽을 가상 이벤트(<<Copy>> 등)로 연결한다.
+        Tk 기본 단축키는 keysym(c/v/x/a) 기준이라 한글 입력기가 켜져 있으면
+        keysym 이 한글 자모로 바뀌어 먹지 않는다. 또 기본 동작은 플랫폼/테마에
+        따라 동작이 들쭉날쭉하다. 그래서 클립보드 동작을 직접 구현하고,
+        단축키(keysym/keycode 양쪽 매칭)와 우클릭 메뉴 어느 쪽으로도 호출되게
+        한다. Entry(ttk 포함)와 Text 위젯 모두 지원한다.
         """
-        def gen(virtual: str):
-            def handler(event):
-                event.widget.event_generate(virtual)
-                return "break"
-            return handler
+        def _is_text(w) -> bool:
+            try:
+                return w.winfo_class() == "Text"
+            except TclError:
+                return False
 
-        def select_all_entry(event):
-            event.widget.select_range(0, "end")
-            event.widget.icursor("end")
-            return "break"
+        def _selected_text(w):
+            try:
+                if _is_text(w):
+                    return w.get("sel.first", "sel.last")
+                if w.selection_present():
+                    return w.get()[int(w.index("sel.first")):int(w.index("sel.last"))]
+            except TclError:
+                pass
+            return None
 
-        def select_all_text(event):
-            event.widget.tag_add("sel", "1.0", "end-1c")
+        def _delete_sel(w) -> None:
+            try:
+                w.delete("sel.first", "sel.last")
+            except TclError:
+                pass
+
+        def _copy(w) -> None:
+            sel = _selected_text(w)
+            if sel:
+                w.clipboard_clear()
+                w.clipboard_append(sel)
+
+        def _cut(w) -> None:
+            sel = _selected_text(w)
+            if not sel:
+                return
+            w.clipboard_clear()
+            w.clipboard_append(sel)
+            _delete_sel(w)
+
+        def _paste(w) -> None:
+            try:
+                text = w.clipboard_get()
+            except TclError:
+                return
+            _delete_sel(w)
+            try:
+                w.insert("insert", text)
+            except TclError:
+                pass
+
+        def _select_all(w) -> None:
+            try:
+                if _is_text(w):
+                    w.tag_add("sel", "1.0", "end-1c")
+                else:
+                    w.select_range(0, "end")
+                    w.icursor("end")
+            except TclError:
+                pass
+
+        # ── 키보드 단축키 ────────────────────────────────────────────────
+        # keycode(물리 키)는 IME 영향을 받지 않지만 플랫폼마다 값이 다르다.
+        if sys.platform == "darwin":
+            codes = {"c": 8, "v": 9, "x": 7, "a": 0}
+        elif sys.platform == "win32":
+            codes = {"c": 67, "v": 86, "x": 88, "a": 65}
+        else:  # linux / X11
+            codes = {"c": 54, "v": 55, "x": 53, "a": 38}
+        ops = {"c": _copy, "v": _paste, "x": _cut, "a": _select_all}
+
+        def _key(event):
+            ks = event.keysym.lower()
+            key = next(
+                (k for k in codes if ks == k or event.keycode == codes[k]), None)
+            if key is None:
+                return None  # 그 외 모디파이어 조합은 기본 동작에 맡긴다
+            ops[key](event.widget)
             return "break"
 
         for mod in ("Command", "Control"):
             for cls in ("TEntry", "Entry", "Text"):
-                self.bind_class(cls, f"<{mod}-c>", gen("<<Copy>>"))
-                self.bind_class(cls, f"<{mod}-v>", gen("<<Paste>>"))
-                self.bind_class(cls, f"<{mod}-x>", gen("<<Cut>>"))
-            for cls in ("TEntry", "Entry"):
-                self.bind_class(cls, f"<{mod}-a>", select_all_entry)
-            self.bind_class("Text", f"<{mod}-a>", select_all_text)
+                self.bind_class(cls, f"<{mod}-KeyPress>", _key)
+
+        # ── 우클릭 컨텍스트 메뉴 ─────────────────────────────────────────
+        menu = Menu(self, tearoff=0)
+        menu.add_command(label="잘라내기",
+                         command=lambda: _cut(self._ctx_target))
+        menu.add_command(label="복사",
+                         command=lambda: _copy(self._ctx_target))
+        menu.add_command(label="붙여넣기",
+                         command=lambda: _paste(self._ctx_target))
+        menu.add_separator()
+        menu.add_command(label="전체 선택",
+                         command=lambda: _select_all(self._ctx_target))
+        self._ctx_target = None
+
+        def _popup(event):
+            self._ctx_target = event.widget
+            try:
+                event.widget.focus_set()
+            except TclError:
+                pass
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        # 우클릭 버튼 번호는 플랫폼마다 다르다 (맥은 Button-2/Ctrl-클릭도 포함).
+        if sys.platform == "darwin":
+            buttons = ("<Button-2>", "<Button-3>", "<Control-Button-1>")
+        else:
+            buttons = ("<Button-3>",)
+        for cls in ("TEntry", "Entry", "Text"):
+            for btn in buttons:
+                self.bind_class(cls, btn, _popup)
 
 
 def main() -> None:
