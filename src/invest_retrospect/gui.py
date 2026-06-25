@@ -766,13 +766,16 @@ class JournalTab(ttk.Frame):
 class AccountLedgerFrame(ttk.Frame):
     """한 계좌의 수동 주식 원장: 매수/매도 변화 기록 → 임의 날짜 매매일지 생성."""
 
-    _COLS = ("check", "date", "market", "name", "code", "side", "qty", "price", "cur", "tag")
+    _COLS = ("check", "date", "market", "name", "code", "side", "qty",
+             "price", "cur", "buytotal", "total", "tag")
     _HEADS = {
         "check": "✓", "date": "거래일", "market": "시장", "name": "종목명", "code": "코드",
-        "side": "구분", "qty": "수량", "price": "단가", "cur": "현재가", "tag": "태그",
+        "side": "구분", "qty": "수량", "price": "단가", "cur": "현재가",
+        "buytotal": "원래총액", "total": "현재총액", "tag": "태그",
     }
     _COL_W = {"check": 34, "date": 80, "market": 64, "name": 130, "code": 70,
-              "side": 50, "qty": 64, "price": 90, "cur": 90, "tag": 70}
+              "side": 50, "qty": 64, "price": 90, "cur": 90,
+              "buytotal": 110, "total": 110, "tag": 70}
     _CHECK_ON, _CHECK_OFF = "☑", "☐"
     _FETCH_INTERVAL_MS = 30_000   # '현재가 조회' 자동 반복 주기 (30초)
 
@@ -789,6 +792,8 @@ class AccountLedgerFrame(ttk.Frame):
         self._auto_fetch = False           # 현재가 자동 조회(30초) 활성 여부
         self._auto_after_id = None         # 다음 자동 조회 예약 id
         self._fetching = False             # 조회 진행 중 — 주기 중복 실행 방지
+        self._sort: tuple[str, bool] | None = None   # (열 키, 내림차순?) — 보기 전용 정렬
+        self._display: list = []           # 현재 표시 순서의 항목(정렬 반영) — 행→항목 매핑
         self._build()
         self._reload_tree()
         self._refresh_price_label()
@@ -849,6 +854,7 @@ class AccountLedgerFrame(ttk.Frame):
         list_frame.rowconfigure(0, weight=1)
         self._check_col = self._COLS.index("check")
         self._cur_col = self._COLS.index("cur")
+        self._total_col = self._COLS.index("total")
         # tksheet 시트: 현재가 셀만 등락색을 칠하기 위해 셀 단위 색상 지원 위젯 사용.
         # (ttk.Treeview 는 행 단위 색만 가능)
         self.sheet = Sheet(
@@ -869,6 +875,12 @@ class AccountLedgerFrame(ttk.Frame):
         # 체크(✓) 열 클릭 토글 · 더블클릭으로 항목 수정
         self.sheet.MT.bind("<ButtonRelease-1>", self._on_sheet_click, add="+")
         self.sheet.MT.bind("<Double-Button-1>", self._on_sheet_double, add="+")
+        # 헤더 클릭 → 보기 전용 정렬(원장 저장 순서는 건드리지 않음).
+        # 열 너비 드래그(리사이즈)와 구분하기 위해 누름 위치를 기록한다.
+        self._hdr_press_x = None
+        self.sheet.CH.bind("<ButtonPress-1>",
+                           lambda e: setattr(self, "_hdr_press_x", e.x), add="+")
+        self.sheet.CH.bind("<ButtonRelease-1>", self._on_header_click, add="+")
         self.sheet.grid(row=0, column=0, columnspan=2, sticky="nsew")
         bar = ttk.Frame(list_frame)
         bar.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 0))
@@ -945,8 +957,11 @@ class AccountLedgerFrame(ttk.Frame):
     def _reload_tree(self) -> None:
         # 사라진 항목의 체크 상태 정리
         self._checked &= {id(e) for e in self.ledger.entries}
+        # 표시 순서 = 정렬 스펙 반영(원장 저장 순서는 그대로 두는 보기 전용 정렬)
+        self._display = self._sorted_entries()
         rows, ups, downs = [], [], []
-        for i, e in enumerate(self.ledger.entries):
+        total_ups, total_downs = [], []
+        for i, e in enumerate(self._display):
             mark = self._CHECK_ON if id(e) in self._checked else self._CHECK_OFF
             cur = self._cur_prices.get(e.stk_cd)
             # 현재가가 단가보다 위/아래인지 +/− 부호로 표시하고, 현재가 셀만 등락색.
@@ -958,8 +973,18 @@ class AccountLedgerFrame(ttk.Frame):
                     cur_txt = f"−{_fmt_price(cur)}"; downs.append(i)
                 else:
                     cur_txt = _fmt_price(cur)
+            # 원래총액 = 수량 × 단가(매입 기준) · 현재총액 = 수량 × (현재가 있으면 현재가, 없으면 단가)
+            buy_total = e.qty * e.price
+            total = e.qty * (cur if cur is not None else e.price)
+            # 현재가가 있을 때만 평가손익(현재총액 vs 원래총액)에 따라 등락색을 칠한다.
+            if cur is not None:
+                if total > buy_total:
+                    total_ups.append(i)
+                elif total < buy_total:
+                    total_downs.append(i)
             rows.append([mark, e.date, e.market, e.stk_nm, e.stk_cd, e.side,
-                         f"{e.qty:,}", _fmt_price(e.price), cur_txt, e.tag])
+                         f"{e.qty:,}", _fmt_price(e.price), cur_txt,
+                         _fmt_price(buy_total), _fmt_price(total), e.tag])
         # 컬럼 너비는 유지(reset_col_positions=False)하고 기존 하이라이트는 초기화.
         self.sheet.set_sheet_data(rows, reset_col_positions=False,
                                   reset_highlights=True, redraw=False)
@@ -970,8 +995,66 @@ class AccountLedgerFrame(ttk.Frame):
         if downs:
             self.sheet.highlight_cells(cells=[(r, c) for r in downs],
                                        fg=_CUR.down, redraw=False)
+        tc = self._total_col
+        if total_ups:
+            self.sheet.highlight_cells(cells=[(r, tc) for r in total_ups],
+                                       fg=_CUR.up, redraw=False)
+        if total_downs:
+            self.sheet.highlight_cells(cells=[(r, tc) for r in total_downs],
+                                       fg=_CUR.down, redraw=False)
+        self._update_sort_headers()
         self.sheet.refresh()
         self._render_summary()
+
+    def _sort_key(self, e, key: str):
+        """정렬 키 — 열별로 형이 섞이지 않도록 같은 타입을 돌려준다."""
+        cur = self._cur_prices.get(e.stk_cd)
+        if key == "check":
+            return id(e) in self._checked
+        if key == "qty":
+            return e.qty
+        if key == "price":
+            return e.price
+        if key == "cur":
+            return cur if cur is not None else float("-inf")
+        if key == "buytotal":
+            return e.qty * e.price
+        if key == "total":
+            return e.qty * (cur if cur is not None else e.price)
+        return {"date": e.date, "market": e.market, "name": e.stk_nm,
+                "code": e.stk_cd, "side": e.side, "tag": e.tag}.get(key, "")
+
+    def _sorted_entries(self) -> list:
+        entries = list(self.ledger.entries)
+        if self._sort is not None:
+            key, reverse = self._sort
+            entries.sort(key=lambda e: self._sort_key(e, key), reverse=reverse)
+        return entries
+
+    def _update_sort_headers(self) -> None:
+        """정렬 중인 열 머리글에 ▲/▼ 표시를 붙인다."""
+        sort_key = self._sort[0] if self._sort else None
+        arrow = " ▼" if (self._sort and self._sort[1]) else " ▲"
+        for idx, c in enumerate(self._COLS):
+            txt = self._HEADS[c] + (arrow if c == sort_key else "")
+            self.sheet.headers(newheaders=txt, index=idx, redraw=False)
+
+    def _on_header_click(self, event) -> None:
+        """헤더 클릭 → 해당 열로 정렬(같은 열 재클릭 시 오름/내림 토글)."""
+        # 너비 조절 드래그면 정렬하지 않음(누름→뗌 이동량으로 판별).
+        if self._hdr_press_x is None or abs(event.x - self._hdr_press_x) > 3:
+            self._hdr_press_x = None
+            return
+        self._hdr_press_x = None
+        col = self.sheet.identify_column(event, allow_end=False)
+        if col is None or not (0 <= col < len(self._COLS)):
+            return
+        key = self._COLS[col]
+        if self._sort and self._sort[0] == key:
+            self._sort = (key, not self._sort[1])   # 방향 토글
+        else:
+            self._sort = (key, False)               # 새 열 → 오름차순
+        self._reload_tree()
 
     def _render_summary(self) -> None:
         """보유 종목 통화별 평가/매입/손익 요약을 목록 아래에 표시. 손익은 한국식
@@ -1008,9 +1091,9 @@ class AccountLedgerFrame(ttk.Frame):
         if self.sheet.identify_column(event, allow_end=False) != self._check_col:
             return
         row = self.sheet.identify_row(event, allow_end=False)
-        if row is None or not (0 <= row < len(self.ledger.entries)):
+        if row is None or not (0 <= row < len(self._display)):
             return
-        eid = id(self.ledger.entries[row])
+        eid = id(self._display[row])
         if eid in self._checked:
             self._checked.discard(eid)
         else:
@@ -1076,19 +1159,18 @@ class AccountLedgerFrame(ttk.Frame):
         if len(sel) != 1:
             messagebox.showinfo("수정", "수정할 항목 한 개를 선택하세요.")
             return
-        self._edit_entry(next(iter(sel)))
+        row = next(iter(sel))
+        if 0 <= row < len(self._display):
+            self._edit_entry(self._display[row])
 
     def _on_sheet_double(self, event) -> None:
         if self.sheet.identify_column(event, allow_end=False) == self._check_col:
             return   # 체크 열은 토글 전용
         row = self.sheet.identify_row(event, allow_end=False)
-        if row is not None and 0 <= row < len(self.ledger.entries):
-            self._edit_entry(row)
+        if row is not None and 0 <= row < len(self._display):
+            self._edit_entry(self._display[row])
 
-    def _edit_entry(self, idx: int) -> None:
-        if not (0 <= idx < len(self.ledger.entries)):
-            return
-        e = self.ledger.entries[idx]
+    def _edit_entry(self, e) -> None:
         win = Toplevel(self)
         win.title("항목 수정")
         win.transient(self.winfo_toplevel())
@@ -1344,8 +1426,11 @@ class AccountLedgerFrame(ttk.Frame):
         sel = self._selected_rows()
         if not sel:
             return
-        keep = [e for i, e in enumerate(self.ledger.entries) if i not in sel]
-        self.ledger.entries = keep
+        # 표시 행 → 항목 객체(정렬 반영). 동일 값 항목이 있어도 id 로 정확히 식별.
+        del_ids = {id(self._display[r]) for r in sel if 0 <= r < len(self._display)}
+        if not del_ids:
+            return
+        self.ledger.entries = [e for e in self.ledger.entries if id(e) not in del_ids]
         self._persist()
         self._reload_tree()
 
