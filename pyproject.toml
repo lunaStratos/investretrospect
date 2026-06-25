@@ -13,6 +13,7 @@ dependencies = [
     "beautifulsoup4>=4.12",   # 시장 대시보드: 네이버 금융 HTML(EUC-KR) 파싱
     "sv-ttk>=2.6",            # GUI 테마: Sun Valley(Windows 11 Fluent) 다크/라이트
     "tksheet>=7.0",           # 수동 원장 표: 현재가 셀 단위 등락색(빨강/파랑) 표시
+    "matplotlib>=3.8",        # 성과 대시보드: 자산추이·수익률·벤치마크 차트(Tkinter 임베드)
 
     # 수동 원장 DB 모드 (외부 DB 테이블 저장). 오프라인 모드만 쓰면 불필요하나,
     # 단일 배포본으로 두 모드를 모두 지원하기 위해 기본 포함한다.

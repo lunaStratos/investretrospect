@@ -87,6 +87,68 @@ def fetch_fx(base: str, quote: str = "KRW") -> float | None:
     return _chart_price(f"{base}{quote}=X")
 
 
+# ── 시계열(일별 종가) ─────────────────────────────────────────────────────────
+# KST(UTC+9). Yahoo 의 epoch 타임스탬프를 한국 날짜(YYYYMMDD)로 환산하는 데 쓴다.
+def _kst_ymd(epoch: int | float) -> str:
+    from datetime import datetime, timedelta, timezone
+    kst = timezone(timedelta(hours=9))
+    return datetime.fromtimestamp(float(epoch), kst).strftime("%Y%m%d")
+
+
+def _chart_series(symbol: str, range_: str, interval: str) -> dict[str, float]:
+    """Yahoo chart endpoint 에서 일별 종가 시계열을 가져온다 (실패 시 {}).
+
+    `_chart_price` 와 같은 호스트·헤더·폴백을 쓰되, range 를 늘려(예: '2y')
+    `timestamp[]` + `indicators.quote[0].close[]` 를 {YYYYMMDD(KST): 종가} 로 만든다.
+    종가가 None(휴장·결측)인 날은 건너뛴다.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return {}
+    for host in _HOSTS:
+        try:
+            r = httpx.get(
+                f"{host}/v8/finance/chart/{symbol}",
+                params={"interval": interval, "range": range_},
+                headers={"User-Agent": _UA},
+                timeout=_TIMEOUT,
+            )
+            r.raise_for_status()
+            result = (((r.json() or {}).get("chart") or {}).get("result")) or []
+            if not result:
+                continue
+            res0 = result[0]
+            stamps = res0.get("timestamp") or []
+            quote = (((res0.get("indicators") or {}).get("quote")) or [{}])[0]
+            closes = quote.get("close") or []
+            out: dict[str, float] = {}
+            for ts, close in zip(stamps, closes):
+                if close is None:
+                    continue
+                out[_kst_ymd(ts)] = float(close)   # 같은 날 중복 시 마지막 값
+            if out:
+                return out
+        except Exception:  # noqa: BLE001  네트워크/JSON 오류 → 다음 호스트/폴백
+            continue
+    return {}
+
+
+def fetch_history(symbol: str, *, range_: str = "2y", interval: str = "1d") -> dict[str, float]:
+    """종목/지수 심볼의 일별 종가 시계열 {YYYYMMDD: 종가}. 실패 시 {}."""
+    s = (symbol or "").strip()
+    return _chart_series(s, range_, interval) if s else {}
+
+
+def fetch_fx_history(base: str, quote: str = "KRW", *, range_: str = "2y") -> dict[str, float]:
+    """환율(예: USD→KRW)의 일별 시계열. 같은 통화면 빈 dict(호출 측에서 1.0 처리)."""
+    base = (base or "").strip().upper()
+    quote = (quote or "KRW").strip().upper()
+    if not base or base == quote:
+        return {}
+    return _chart_series(f"{base}{quote}=X", range_, "1d")
+
+
 def resolve_prices(
     symbols: list[tuple[str, str]],
     manual_prices: dict[str, float] | None = None,

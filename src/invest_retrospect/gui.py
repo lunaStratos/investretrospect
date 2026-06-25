@@ -32,7 +32,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from tksheet import Sheet
 
-from invest_retrospect import ledger_db, market, prices
+from invest_retrospect import ledger_db, market, performance, prices
 from invest_retrospect.brokers import Broker
 from invest_retrospect.core import JournalResult, run_journal, today_ymd
 from invest_retrospect.manual import (
@@ -2130,6 +2130,263 @@ class MarketTab(ttk.Frame):
             tree.insert("", "end", values=vals, tags=(tag,))
 
 
+_MPL_FONT_SET = False
+
+
+def _set_mpl_korean_font(matplotlib) -> None:
+    """matplotlib 차트의 한글 라벨이 □(tofu)로 깨지지 않도록 한글 폰트를 1회 설정.
+
+    플랫폼별 기본 한글 폰트를 우선 적용하고, 설치된 것 중 처음 발견된 것을 쓴다.
+    실패해도 차트는 그려지므로 조용히 넘어간다(영문/숫자는 정상).
+    """
+    global _MPL_FONT_SET
+    if _MPL_FONT_SET:
+        return
+    _MPL_FONT_SET = True
+    try:
+        from matplotlib import font_manager
+        if sys.platform == "darwin":
+            prefer = ("AppleGothic", "Apple SD Gothic Neo", "NanumGothic")
+        elif sys.platform.startswith("win"):
+            prefer = ("Malgun Gothic", "NanumGothic", "Gulim")
+        else:
+            prefer = ("NanumGothic", "Noto Sans CJK KR", "UnDotum")
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        for name in prefer:
+            if name in available:
+                matplotlib.rcParams["font.family"] = name
+                break
+        matplotlib.rcParams["axes.unicode_minus"] = False   # 음수 기호 깨짐 방지
+    except Exception:  # noqa: BLE001  폰트 설정 실패해도 차트 자체는 동작
+        pass
+
+
+class PerformanceDashboardTab(ttk.Frame):
+    """성과 대시보드 — 수동 원장/DB 를 재생해 자산추이·수익률·벤치마크를 그린다.
+
+    상단 차트: 내 수익률(시간가중, base100) + 선택 벤치마크(KOSPI/S&P500 등).
+    하단 차트: 자산추이(원화 평가금액) + 누적 실현손익(원화). 조회는 백그라운드
+    스레드에서 수행하고 완료 시 메인스레드에서 그린다. matplotlib 미설치 시엔
+    설치 안내를 보여주고 비활성화한다.
+    """
+
+    def __init__(self, master: ttk.Notebook, app: "App") -> None:
+        super().__init__(master, padding=PAD)
+        self.app = app
+        self.account_var = StringVar(value="")
+        self.start_var = StringVar(value="")
+        self.end_var = StringVar(value=today_ymd())
+        self.status_var = StringVar(value="대기 중")
+        self.bench_vars: dict[str, BooleanVar] = {
+            name: BooleanVar(value=(name == "KOSPI"))
+            for name in performance.BENCHMARKS
+        }
+        self._loading = False
+        self._mpl_ok = False
+        self._build()
+
+    # ── UI ───────────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, sticky="we", pady=(0, PAD))
+        ttk.Label(bar, text="계좌").pack(side="left", padx=(0, 4))
+        self.account_cmb = ttk.Combobox(bar, textvariable=self.account_var,
+                                        state="readonly", width=14)
+        self.account_cmb.pack(side="left", padx=(0, PAD))
+        ttk.Label(bar, text="시작").pack(side="left", padx=(0, 4))
+        ttk.Entry(bar, textvariable=self.start_var, width=10).pack(side="left", padx=(0, PAD))
+        ttk.Label(bar, text="종료").pack(side="left", padx=(0, 4))
+        ttk.Entry(bar, textvariable=self.end_var, width=10).pack(side="left", padx=(0, PAD))
+        ttk.Button(bar, text="새로고침", command=self._refresh).pack(side="left")
+        ttk.Label(bar, textvariable=self.status_var, style="Hint.TLabel").pack(side="right")
+
+        bbar = ttk.Frame(self)
+        bbar.grid(row=1, column=0, sticky="we", pady=(0, PAD))
+        ttk.Label(bbar, text="벤치마크").pack(side="left", padx=(0, PAD))
+        for name in performance.BENCHMARKS:
+            ttk.Checkbutton(bbar, text=name, variable=self.bench_vars[name]).pack(side="left")
+        self.stats_var = StringVar(value="")
+        ttk.Label(bbar, textvariable=self.stats_var).pack(side="right")
+
+        body = ttk.Frame(self)
+        body.grid(row=2, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        try:
+            import matplotlib
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+            _set_mpl_korean_font(matplotlib)
+            self._Figure = Figure
+            self.fig = Figure(figsize=(7, 5), dpi=100)
+            self.ax_top = self.fig.add_subplot(211)
+            self.ax_bot = self.fig.add_subplot(212, sharex=self.ax_top)
+            # 누적 실현손익용 보조축은 한 번만 생성해 재사용한다(매 갱신 twinx() 누적 방지).
+            self.ax_twin = self.ax_bot.twinx()
+            self.canvas = FigureCanvasTkAgg(self.fig, master=body)
+            self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+            self._mpl_ok = True
+        except Exception as e:  # noqa: BLE001  matplotlib 미설치/임포트 실패
+            self._mpl_ok = False
+            msg = ("차트를 그리려면 matplotlib 가 필요합니다.\n"
+                   "  pip install matplotlib\n"
+                   f"(import 실패: {e})")
+            ttk.Label(body, text=msg, style="Hint.TLabel", justify="left").grid(
+                row=0, column=0, sticky="nw")
+
+    # ── 가시성 ─────────────────────────────────────────────────────────────
+    def set_active(self, active: bool) -> None:
+        """이 탭이 선택되면 계좌 목록을 최신 원장으로 채운다(조회는 수동)."""
+        if not active:
+            return
+        book = self._load_book(silent=True)
+        if book is None:
+            return
+        names = list(book.accounts.keys())
+        self.account_cmb.configure(values=names)
+        if self.account_var.get() not in names:
+            self.account_var.set(book.active if book.active in names
+                                 else (names[0] if names else ""))
+
+    # ── 원장 로드 (수동 원장 탭과 동일한 오프라인/DB 분기) ──────────────────
+    def _load_book(self, *, silent: bool = False) -> "LedgerBook | None":
+        self.app.flush_save()
+        s = self.app.settings
+        if (s.manual_ledger_mode or "offline") != "db":
+            return load_book()
+        try:
+            return ledger_db.load_book(ledger_db.DbSettings.from_settings(s))
+        except Exception as e:  # noqa: BLE001  접속/드라이버/SQL 오류
+            if not silent:
+                self.status_var.set(f"DB 로드 실패: {e}")
+            return None
+
+    # ── 데이터 ─────────────────────────────────────────────────────────────
+    def _refresh(self) -> None:
+        if self._loading or not self._mpl_ok:
+            return
+        book = self._load_book()
+        if book is None:
+            return
+        name = self.account_var.get() or book.active
+        ledger = book.accounts.get(name)
+        if ledger is None or not ledger.entries:
+            self.status_var.set("선택한 계좌에 매매 기록이 없습니다.")
+            self._clear_plot()
+            return
+        entries = list(ledger.entries)
+        end = (self.end_var.get() or today_ymd()).strip()
+        start = (self.start_var.get() or "").strip()
+        if not start:                       # 기본: 원장 첫 거래일
+            start = min(e.date for e in entries if e.date)
+            self.start_var.set(start)
+        benches = [n for n, v in self.bench_vars.items() if v.get()]
+
+        self._loading = True
+        self.status_var.set("불러오는 중…")
+        threading.Thread(
+            target=self._worker, args=(entries, start, end, benches, name),
+            daemon=True).start()
+
+    def _worker(self, entries, start, end, benches, name) -> None:
+        try:
+            warns: list[str] = []
+            series = performance.build_equity_curve(
+                entries, start, end, log=warns.append)
+            bench_lines = {}
+            for b in benches:
+                line = performance.benchmark_index(b, series.dates)
+                if line is not None:
+                    bench_lines[b] = line
+            stats = performance.compute_stats(series, entries)
+            self.after(0, self._apply, series, bench_lines, stats, name, warns)
+        except Exception as e:  # noqa: BLE001
+            self.after(0, self._on_error, e)
+
+    def _on_error(self, exc: Exception) -> None:
+        self._loading = False
+        self.status_var.set(f"실패: {exc}")
+
+    def _clear_plot(self) -> None:
+        if not self._mpl_ok:
+            return
+        self.ax_top.clear()
+        self.ax_bot.clear()
+        self.ax_twin.clear()
+        self.stats_var.set("")
+        self.canvas.draw()
+
+    def _apply(self, series, bench_lines: dict, stats, name: str,
+               warns: list[str] | None = None) -> None:
+        self._loading = False
+        if not series.dates:
+            self.status_var.set("해당 기간에 표시할 데이터가 없습니다.")
+            self._clear_plot()
+            return
+        from datetime import datetime
+        xs = [datetime.strptime(d, "%Y%m%d") for d in series.dates]
+        # 팔레트 색은 sv-ttk 테마에서 Tcl 객체로 올 수 있어 matplotlib 용으로 str 강제.
+        pal = _CUR
+        bg, fg = str(pal.bg), str(pal.fg)
+        ebg, border, flat = str(pal.entry_bg), str(pal.border), str(pal.flat)
+        self.ax_twin.clear()   # 보조축은 재사용(매 갱신 새로 만들지 않음)
+        for ax in (self.ax_top, self.ax_bot):
+            ax.clear()
+            ax.set_facecolor(ebg)
+            ax.tick_params(colors=fg, labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_color(border)
+            ax.grid(True, color=border, alpha=0.4, linewidth=0.5)
+        self.fig.set_facecolor(bg)
+
+        # 상단: 내 수익률(base100) + 벤치마크
+        self.ax_top.plot(xs, series.return_index, color="#e67e22",
+                         linewidth=1.8, label=f"내 수익률({name})")
+        bench_colors = {"KOSPI": "#d60000", "KOSDAQ": "#cc7700",
+                        "S&P500": "#2e86de", "NASDAQ": "#8e44ad"}
+        for bname, line in bench_lines.items():
+            self.ax_top.plot(xs, line, linewidth=1.1, alpha=0.85,
+                             color=bench_colors.get(bname, flat), label=bname)
+        self.ax_top.axhline(100, color=flat, linewidth=0.6, alpha=0.5)
+        self.ax_top.set_title("수익률 비교 (시작=100)", color=fg, fontsize=9)
+        self.ax_top.legend(loc="upper left", fontsize=7, framealpha=0.3)
+
+        # 하단: 자산추이(원화) + 누적 실현손익(원화, 보조축)
+        self.ax_bot.plot(xs, series.equity_krw, color="#2e86de",
+                         linewidth=1.6, label="자산추이(원화)")
+        ax2 = self.ax_twin
+        ax2.plot(xs, series.cum_realized_krw, color="#27ae60",
+                 linewidth=1.2, linestyle="--", label="누적 실현손익")
+        ax2.tick_params(colors=fg, labelsize=8)
+        ax2.axhline(0, color=flat, linewidth=0.5, alpha=0.4)
+        self.ax_bot.set_title("자산추이 · 누적 실현손익 (원화)", color=fg, fontsize=9)
+        l1, lab1 = self.ax_bot.get_legend_handles_labels()
+        l2, lab2 = ax2.get_legend_handles_labels()
+        self.ax_bot.legend(l1 + l2, lab1 + lab2, loc="upper left", fontsize=7, framealpha=0.3)
+
+        self.fig.autofmt_xdate()
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        excess = ""
+        if bench_lines:
+            b0 = next(iter(bench_lines))
+            diff = stats.total_return_pct - (bench_lines[b0][-1] - 100.0)
+            excess = f" · {b0} 대비 {diff:+.1f}%p"
+        self.stats_var.set(
+            f"총수익률 {stats.total_return_pct:+.1f}% · MDD {stats.mdd_pct:.1f}% · "
+            f"승률 {stats.win_rate_pct:.0f}%({stats.win_count}/{stats.trade_count}) · "
+            f"실현손익 {stats.cum_realized_krw:+,.0f}원{excess}")
+        # 시세/환율 시계열 조회 실패가 있으면 결과가 추정값을 포함함을 알린다.
+        if warns:
+            self.status_var.set(f"갱신 완료 · ⚠ 일부 시세/환율 추정({len(warns)}건)")
+        else:
+            self.status_var.set("갱신 완료")
+
+
 class App(Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -2158,10 +2415,12 @@ class App(Tk):
         self.nb = nb
         self.journal_tab = JournalTab(nb, self)
         self.manual_tab = ManualLedgerTab(nb, self)
+        self.perf_tab = PerformanceDashboardTab(nb, self)
         self.market_tab = MarketTab(nb, self)
         self.settings_tab = SettingsTab(nb, self)
         nb.add(self.journal_tab, text="매매일지")
         nb.add(self.manual_tab, text="수동 원장")
+        nb.add(self.perf_tab, text="성과")
         nb.add(self.market_tab, text="시장")
         nb.add(self.settings_tab, text="설정")
         # 시장 탭은 보일 때만 자동 갱신 (불필요한 네트워크 요청 방지)
@@ -2322,6 +2581,8 @@ class App(Tk):
         self.market_tab.set_active(current is self.market_tab)
         if current is self.manual_tab:
             self.manual_tab.reload_if_source_changed()
+        if current is self.perf_tab:
+            self.perf_tab.set_active(True)
 
     def _active_broker_ready(self) -> bool:
         b = self.settings.broker or "kiwoom"

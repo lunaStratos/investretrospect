@@ -28,6 +28,7 @@ for pkg in (
     "openpyxl",          # 수동 원장 엑셀 업로드/샘플
     "bs4",               # 시장 대시보드 HTML 파싱
     "tksheet",           # 수동 원장 표(현재가 셀 등락색)
+    "matplotlib",        # 성과 대시보드 차트(데이터/폰트/백엔드 포함)
 ):
     try:
         d, b, h = collect_all(pkg)
@@ -63,7 +64,10 @@ a = Analysis(
         "invest_retrospect.manual",
         "invest_retrospect.prices",
         "invest_retrospect.market",
+        "invest_retrospect.performance",
+        "invest_retrospect.ledger_db",
         "invest_retrospect.types",
+        "matplotlib.backends.backend_tkagg",
         *_all_hidden,
     ],
     hookspath=[],
